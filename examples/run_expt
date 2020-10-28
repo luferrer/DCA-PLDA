@@ -32,11 +32,16 @@ ini_meta=$data_dir/train/metadata_$train_set
 train_config1=configs/train/stage1.ini
 train_config2=configs/train/stage2.ini
 
-export CUDA_VISIBLE_DEVICES=$device
-
 ###### Training in two stages
 
-train_flags="--restart --cuda --seed $seed"
+train_flags="--restart --seed $seed"
+if [ $device != 'CPU' ]; then
+    train_flags="$train_flags --cuda"
+    export CUDA_VISIBLE_DEVICES=$device
+else
+    export CUDA_VISIBLE_DEVICES=""
+fi
+
 out_dir=$root_dir/
 mkdir -p $out_dir/stage1/models
 dev_table=$out_dir/stage1/models/dev_table

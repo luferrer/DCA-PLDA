@@ -47,7 +47,7 @@
 # considered in training.
 
 
-gpu=3
+device=CPU # Or use the GPU number, if GPU is available
 seed=0
 
 for trndata in vox vox+fvcaus; do
@@ -57,7 +57,7 @@ for trndata in vox vox+fvcaus; do
 	conf=configs/arch/$archn.ini
     
 	out_dir=output/train_${trndata}_dev_sitw/$archn/seed$seed
-	./run_expt -d "sitw.dev" -o $out_dir -a $conf -D $gpu -s $seed -t $trndata
+	./run_expt -d "sitw.dev" -o $out_dir -a $conf -D $device -s $seed -t $trndata
 
     done
 

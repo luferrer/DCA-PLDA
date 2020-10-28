@@ -29,7 +29,7 @@ This code was written by Luciana Ferrer. The pre-computed embeddings provided to
    
    Untar the file and move (or link) the resulting data/ dir inside the example dir.
 
-4. You can then run the run_all script which runs several experiments using different configuration files and training sets. You can edit it to just try a single configuration, if you want. Please, see the top of that script for an explanation on what is run and where the output results end up. Note that this script is meant to be run on a GPU (though it can also run in a CPU by disabling the --cuda flag in run_expt) for speed. It will take a few hours to run if all configurations are run.
+4. You can then run the run_all script which runs several experiments using different configuration files and training sets. You can edit it to just try a single configuration, if you want. Please, see the top of that script for an explanation on what is run and where the output results end up. The script will take a few hours to run (on a GPU) if all configurations are run.
 
 ## About the example
 
