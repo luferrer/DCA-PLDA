@@ -1,0 +1,76 @@
+#!/bin/bash -e
+#
+# Run two different backends, with different architectures
+#
+# * plain DPLDA: PLDA form trained discriminatively
+#
+# * sideinfo dependent DPLDA: same as above with the
+#   addition of a calibration stage that depends on an automatically
+#   extracted side-info vector.
+#
+# Results from this script can be found in the following files
+#
+# output/train*/*/seed*/stage*/eval_best/all_results
+#
+# The results include counts, EER, Cllr and DCF metrics. Cllr and DCF
+# are computed with two different ptar values. Also, we compute the
+# actual value as well as the min value for each case. The min values
+# for the Cllr metrics are computed in two different ways: by doing a
+# cheating linear logistic regression on the test data itself (the
+# ones called "LIN") and by using the PAV algorithm on the test data
+# (called "PAV"). The PAV estimates are slightly lower since that
+# model is non-parametric and can adapt more to the test data, which
+# might result in overfitting.
+#
+# Training is run in two stages, to allow for different training
+# parameters in each stage.  For each run, we evaluate the first and
+# the best iteration on each of the two training stages. Results from
+# iteration 0000 in stage 1 should be pretty similar to what you would
+# get with a PLDA backend using the same training data.
+#
+# Results from this script show that:
+#
+# * Simple Discriminative PLDA gives better results than PLDA
+#
+# * When training only with vox data, perfomance on vox-like sets
+#   (voxceleb2 and sitw) is very good for all three models, with
+#   DCA-PLDA outperforming the other two by a small margin
+#
+# * When training with vox and fvcaus data, performance of PLDA
+#   vox-like data degrades significantly. On the other hand,
+#   performance with DCA-PLDA on vox-like sets is almost as good as
+#   when training with vox only, while giving large gains on fvcaus
+#   heldout data.
+#
+# Hence, DCA-PLDA allows us to use heterogeous data to train a single
+# SID system that gives excellent performance for all conditions
+# considered in training.
+
+
+gpu=3
+seed=0
+
+for trndata in vox vox+fvcaus; do
+
+    for archn in dplda dplda_sidep; do
+
+	conf=configs/arch/$archn.ini
+    
+	out_dir=output/train_${trndata}_dev_sitw/$archn/seed$seed
+	./run_expt -d "sitw.dev" -o $out_dir -a $conf -D $gpu -s $seed -t $trndata
+
+    done
+
+    echo ""
+    echo "############ Training with $trndata ###########################################"
+    echo "# PLDA"
+    cat output/train_${trndata}_dev_sitw/dplda/seed$seed/stage1/eval_ep0000/all_results
+    echo ""
+    echo "# Discriminative PLDA"
+    cat output/train_${trndata}_dev_sitw/dplda/seed$seed/stage2/eval_best/all_results
+    echo ""
+    echo "# Discriminative Condition-Aware PLDA"
+    cat output/train_${trndata}_dev_sitw/dplda_sidep/seed$seed/stage2/eval_best/all_results
+    
+done
+

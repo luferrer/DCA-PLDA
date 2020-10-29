@@ -1,0 +1,6 @@
+h5py
+numpy
+scikit-learn
+scipy
+torch
+torchviz
