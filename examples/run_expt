@@ -1,4 +1,4 @@
-#!/bin/bash -e
+#!/bin/bash -ex
 
 export PYTHONPATH=../dca_plda:$PYTHONPATH
 
@@ -76,7 +76,7 @@ for stage in stage1 stage2; do
 
     # Evaluate the first and the best model in each stage
     best_model=`ls $out_dir/$stage/models/best*.pth`
-    first_model=`ls $out_dir/$stage/models/model_epoch_0000*`
+    first_model=`ls $out_dir/$stage/models/first*.pth`
 
     for model in $best_model $first_model; do
 
@@ -114,3 +114,7 @@ for stage in stage1 stage2; do
     done
 
 done
+
+# Delete all models except the first, best and last, which are saved in a copy with specific names
+find $out_dir/ -name "model_epoch*" | xargs rm
+
