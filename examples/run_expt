@@ -1,4 +1,4 @@
-#!/bin/bash -ex
+#!/bin/bash -e
 
 export PYTHONPATH=../dca_plda:$PYTHONPATH
 
@@ -116,5 +116,5 @@ for stage in stage1 stage2; do
 done
 
 # Delete all models except the first, best and last, which are saved in a copy with specific names
-find $out_dir/ -name "model_epoch*" | xargs rm
+find $out_dir/ -name "model_epoch*" | xargs rm -f
 

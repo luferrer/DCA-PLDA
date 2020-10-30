@@ -62,8 +62,9 @@ for trndata in vox vox+fvcaus; do
     done
 
     echo ""
-    echo "############ Training with $trndata ###########################################"
-    echo "# PLDA"
+    echo "################################## Training with $trndata ###########################################################"
+    echo ""
+    echo "# PLDA with global calibration"
     cat output/train_${trndata}_dev_sitw/dplda/seed$seed/stage1/eval_ep0000/all_results
     echo ""
     echo "# Discriminative PLDA"
@@ -71,6 +72,6 @@ for trndata in vox vox+fvcaus; do
     echo ""
     echo "# Discriminative Condition-Aware PLDA"
     cat output/train_${trndata}_dev_sitw/dplda_sidep/seed$seed/stage2/eval_best/all_results
-    
+    echo ""
 done
 
