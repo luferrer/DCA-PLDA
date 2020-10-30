@@ -5,7 +5,7 @@ export PYTHONPATH=../dca_plda:$PYTHONPATH
 # Defaults
 train_set=vox+fvcaus
 dev_sets="sitw.dev"
-arch_config=configs/arch/dur_and_meta_dep_dplda.ini
+arch_config=configs/arch/dplda.ini
 seed=0
 device=0
 root_dir=output
@@ -57,10 +57,14 @@ done > $dev_table
 date=`date +%Y.%m.%d.%H.%M`
 
 if [ ! -f $out_dir/stage1/models/DONE ]; then
+    echo "Starting stage1 in $out_dir/stage1/models"
+    echo "Log file: $out_dir/stage1/models/log.$date"
     python -u ../scripts/train.py $train_flags --configs $train_config1,$arch_config --init_subset $ini_meta $trn_emb $trn_meta $dev_table $out_dir/stage1/models > $out_dir/stage1/models/log.$date
 fi
 
 if [ ! -f $out_dir/stage2/models/DONE ] && [ $train_config2 != "" ]; then
+    echo "Starting stage1 in $out_dir/stage2/models"
+    echo "Log file: $out_dir/stage2/models/log.$date"
     # Copy the last model from stage1 in the outdir for stage2. Since we set --restart, the training script will look for
     # existing models and load it up.
     last_model_from_first_stage=`ls $out_dir/stage1/models/last_*`
