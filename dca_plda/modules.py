@@ -430,9 +430,9 @@ class Quadratic(nn.Module):
         WtGL              = np.dot(W.T,L_tilde-G_tilde)
         _, logdet_L_tilde = np.linalg.slogdet(L_tilde)
         _, logdet_G_tilde = np.linalg.slogdet(G_tilde)
-        _, logdet_B       = np.linalg.slogdet(B)
-        k_tilde           = 2.0*logdet_G_tilde - logdet_B - logdet_L_tilde + np.dot(mu.T, Bmu) 
-        
+        _, logdet_B       = np.linalg.slogdet(B)       
+        k_tilde           = -2.0*logdet_G_tilde + logdet_L_tilde - logdet_B + np.dot(mu.T, Bmu) 
+
         k = 0.5 * k_tilde + 0.5 * np.dot(Bmu.T, np.dot(L_tilde - 2*G_tilde, Bmu))
         L = 0.5 * np.dot(W.T,np.dot(L_tilde,W))
         G = 0.5 * np.dot(WtGL,W)
