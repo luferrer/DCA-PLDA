@@ -226,26 +226,25 @@ class CA_Calibrator(nn.Module):
         self.is_sidep = False
         self.is_durdep = False
 
+        if self.config:
+            self.dur_rep = self.config.get('duration_representation', 'log') 
+            self.dur_thresholds = self.config.get('duration_thresholds')
+            self.si_cal_first = self.config.get('si_cal_first', True) 
+            numdurf = self._process_durs(torch.ones(10)).shape[1]
+
         if self.config and self.config.get('sideinfo_dependent'):
-            assert config is not None
             self.is_sidep = True
+            use_G = config.get("use_G_for_si", True) 
+            use_C = config.get("use_C_for_si", True)
             self.si_dim = si_dim
-            self.si_cal_first = config.get('si_cal_first', True) if config is not None else True
-            use_G = config.get("use_G_for_si", config.get("use_G",True)) 
-            use_C = config.get("use_C_for_si", config.get("use_C",True))
+            if self.config.get('concat_durfeats_with_sideinfo'):
+                self.si_dim += numdurf
             self.sidep_alpha = Quadratic(self.si_dim, use_G=use_G, use_C=use_C)
             self.sidep_beta  = Quadratic(self.si_dim, use_G=use_G, use_C=use_C)
 
         if self.config and self.config.get('duration_dependent'):
             self.is_durdep = True
-            self.dur_rep = self.config.get('duration_representation', 'log') 
-            if self.dur_rep == 'log':
-                numdurf = 1
-            elif self.dur_rep == 'discrete':
-                self.dur_thresholds = self.config.get('duration_thresholds')
-                numdurf = len(self.dur_thresholds)+1 
-            else:
-                raise Exception("Duration representation %s not implemented"%self.dur_rep)
+            # Fake input to _process_durs just to get the dimension of the processed duration vector
             use_G = config.get("use_G_for_dur", True) 
             use_C = config.get("use_C_for_dur", True) 
             self.durdep_alpha = Quadratic(numdurf, use_G=use_G, use_C=use_C)
@@ -272,18 +271,28 @@ class CA_Calibrator(nn.Module):
     def _process_durs(self, durations):
         
         if self.dur_rep == 'log':
-            durs = durations.unsqueeze(1)
-            durs = torch.log(durs)
+            durs = torch.log(durations.unsqueeze(1))
         else:
             durs_disc = self._bucketize(durations, self.dur_thresholds)
-            durs = nn.functional.one_hot(durs_disc, num_classes=len(self.dur_thresholds)+1).type(torch.get_default_dtype())
+            durs_onehot = nn.functional.one_hot(durs_disc, num_classes=len(self.dur_thresholds)+1).type(torch.get_default_dtype())
+            if self.dur_rep == 'pwlog':
+                durs = torch.log(durations.unsqueeze(1)) * durs_onehot
+            elif self.dur_rep == 'discrete':            
+                durs = durs_onehot
+            else:
+                raise Exception("Duration representation %s not implemented"%self.dur_rep)
 
         return durs
 
     def calibrate(self, scores, durations_enroll=None, side_info_enroll=None, durations_test=None, side_info_test=None):
 
         if self.is_sidep:
-            # Sideinfo-dep calibration
+            # Sideinfo-dep calibration, optionally with the duration appended
+            if self.config.get('concat_durfeats_with_sideinfo'):
+                durs_enroll = self._process_durs(durations_enroll)
+                durs_test   = self._process_durs(durations_test) if durations_test is not None else None
+                side_info_enroll = torch.cat([durs_enroll, side_info_enroll], 1)
+                side_info_test   = torch.cat([durs_test,   side_info_test],   1) if side_info_test is not None else None
             alpha_si = self.sidep_alpha.score(side_info_enroll, side_info_test)
             beta_si  = self.sidep_beta.score(side_info_enroll, side_info_test)
             if self.si_cal_first:
@@ -343,6 +352,8 @@ class CA_Calibrator(nn.Module):
 
 
 class Quadratic(nn.Module):
+    """ Note that, while I am calling this class Quadratic, it is actually a
+    second order polynomial on the inputs rather than just quadratic"""
     def __init__(self, in_dim, use_G=True, use_C=True):
         super().__init__()
         self.L = Parameter(torch.zeros(in_dim, in_dim))
@@ -402,28 +413,29 @@ class Quadratic(nn.Module):
         # Get the within and between-class covariance matrices
         # WCov is the covariance of the noise term in SPLDA and BCov = inverse(V V^t)
 
-        weights = compute_sample_weights(speaker_ids, domain_ids, init_params)
+        weights = compute_sample_weights(speaker_ids, domain_ids, init_params.get('balance_by_speaker'), init_params.get('balance_by_domain'))
                 
         BCov, WCov, _, mu, _ = compute_lda_model(x, speaker_ids, weights)
 
-        Binv = np.linalg.inv(BCov)
-        Winv = np.linalg.inv(WCov)
+        # B and W are the between and within precission matrices
+        B = np.linalg.inv(BCov)
+        W = np.linalg.inv(WCov)
 
         # Equations (14) and (16) in Cumani's paper 
-        # Note that the paper has a couple of errors in the derivations, in the k_tilde formula and in k
+        # Note that the paper has an error in the formula for k (a 1/2 missing before k_tilde) 
         # that are fixed in the equations below
-        Bmu               = np.dot(Binv,mu)
-        L_tilde           = np.linalg.inv(Binv+2*Winv)
-        G_tilde           = np.linalg.inv(Binv+Winv)
-        WtGL              = np.dot(Winv.T,L_tilde-G_tilde)
+        Bmu               = np.dot(B,mu)
+        L_tilde           = np.linalg.inv(B+2*W)
+        G_tilde           = np.linalg.inv(B+W)
+        WtGL              = np.dot(W.T,L_tilde-G_tilde)
         _, logdet_L_tilde = np.linalg.slogdet(L_tilde)
         _, logdet_G_tilde = np.linalg.slogdet(G_tilde)
-        _, logdet_Binv    = np.linalg.slogdet(Binv)
-        k_tilde           = -2.0*logdet_G_tilde - logdet_Binv + logdet_L_tilde + np.dot(mu.T, Bmu) 
-
-        k = 0.5 * k_tilde + 0.5 * np.dot(Bmu.T, np.dot(G_tilde - 2*L_tilde, Bmu))
-        L = 0.5 * np.dot(Winv.T,np.dot(L_tilde,Winv))
-        G = 0.5 * np.dot(WtGL,Winv)
+        _, logdet_B       = np.linalg.slogdet(B)
+        k_tilde           = 2.0*logdet_G_tilde - logdet_B - logdet_L_tilde + np.dot(mu.T, Bmu) 
+        
+        k = 0.5 * k_tilde + 0.5 * np.dot(Bmu.T, np.dot(L_tilde - 2*G_tilde, Bmu))
+        L = 0.5 * np.dot(W.T,np.dot(L_tilde,W))
+        G = 0.5 * np.dot(WtGL,W)
         C = np.dot(WtGL,Bmu)[:,np.newaxis]
 
         if init_params.get('norm_plda_params'):
@@ -478,7 +490,10 @@ class Affine(nn.Module):
         if self.has_bias is False:
             raise Exception("Cannot initialize this component with init_with_lda because it was created with bias=False")
 
-        weights = compute_sample_weights(class_ids, sec_ids, init_params)
+        bbs = init_params.get('balance_by_speaker_lda', init_params.get('balance_by_speaker'))
+        bbd = init_params.get('balance_by_domain_lda', init_params.get('balance_by_domain'))
+        
+        weights = compute_sample_weights(class_ids, sec_ids, bbs, bbd)
                 
         BCov, WCov, GCov, mu, mu_per_class = compute_lda_model(x, class_ids, weights)
 
@@ -582,17 +597,30 @@ def compute_lda_model(x, class_ids, weights):
     return BCov, WCov, GCov, mu, muc
 
 
-def compute_sample_weights(speaker_ids, domain_ids, init_params):
+def compute_sample_weights(speaker_ids, domain_ids, balance_by_speaker, balance_by_domain):
 
     weights = np.ones_like(speaker_ids, dtype=float)
+    doms = np.unique(domain_ids)
 
-    if init_params.get('balance_by_domain'):
-        assert domain_ids is not None
-        dom_weight = 1.0/np.bincount(domain_ids) 
+    if balance_by_domain:
+        if balance_by_domain == 'with_spk_count':
+            dom_weight = np.ones_like(doms, dtype=float)
+            for d in doms:
+                dom_weight[d] = 1.0/len(np.unique(speaker_ids[domain_ids==d]))
+        else:
+            dom_weight = 1.0/np.bincount(domain_ids) 
         weights *= dom_weight[domain_ids]
         
-    if init_params.get('balance_by_speaker'):
+    if balance_by_speaker:
         spk_weight = 1.0/np.bincount(speaker_ids) 
         weights *= spk_weight[speaker_ids]
+
+    sum_weights_per_dom = np.ones_like(doms, dtype=float)
+    for d in doms:
+        sum_weights_per_dom[d] = np.sum(weights[domain_ids==d])
+
+    print("Num samples per domain: %s"%np.bincount(domain_ids))
+    print("Sum of weights per domain: %s"%(sum_weights_per_dom/np.sum(sum_weights_per_dom)))
+
 
     return weights

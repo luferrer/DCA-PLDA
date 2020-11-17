@@ -5,7 +5,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
 from data import SpeakerDataset
-from utils import np_to_torch, evaluate, load_model
+from utils import np_to_torch, evaluate, load_model, compute_sideinfo
 from IPython import embed
 from scores import *
 
