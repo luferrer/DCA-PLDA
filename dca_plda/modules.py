@@ -198,7 +198,7 @@ class DCA_PLDA_Backend(nn.Module):
             scrs_torch = self.plda_stage(x2_torch)
             same_spk_torch, valid_torch = utils.create_scoring_masks(meta_batch)
             scrs, same_spk, valid = [v.detach().cpu().numpy() for v in [scrs_torch, same_spk_torch, valid_torch]]
-        
+
             self.cal_stage.init_with_logreg(scrs, same_spk, valid, config.ptar, std_for_mats=init_params.get('std_for_cal_matrices',0))
 
             dummy_durs = torch.ones(scrs.shape[0]).to(device) 
@@ -410,45 +410,49 @@ class Quadratic(nn.Module):
         # Compute a PLDA model with the input data, approximating the 
         # model with just the usual initialization without the EM iterations
 
-        # Get the within and between-class covariance matrices
-        # WCov is the covariance of the noise term in SPLDA and BCov = inverse(V V^t)
+        weights = compute_class_weights(speaker_ids, domain_ids, init_params.get('balance_by_domain'))
 
-        weights = compute_sample_weights(speaker_ids, domain_ids, init_params.get('balance_by_speaker'), init_params.get('balance_by_domain'))
-                
-        BCov, WCov, _, mu, _ = compute_lda_model(x, speaker_ids, weights)
-
-        # B and W are the between and within precission matrices
-        B = np.linalg.inv(BCov)
-        W = np.linalg.inv(WCov)
-
+        # Debugging of weight usage in PLDA:
+        # Repeat the data from the first 5000 speakers twice either explicitely or through the weights
+        # These two models should be identical (and they are!)
+        #sela = speaker_ids<5000
+        #selb = speaker_ids>=5000
+        #x2 = np.concatenate([x[sela],x[sela],x[selb]])
+        #speaker_ids2 = np.concatenate((speaker_ids[sela], speaker_ids[sela]+np.max(speaker_ids)+1, speaker_ids[selb]))
+        #weights2 = np.ones(len(np.unique(speaker_ids2)))
+        #BCov2, WCov2, mu2 = compute_2cov_plda_model(x2, speaker_ids2, weights2, 10)
+        #weights3 = weights.copy()
+        #weights3[0:5000] *= 2
+        #BCov3, WCov3, mu3 = compute_2cov_plda_model(x, speaker_ids, weights3, 10)
+        #assert np.allclose(BCov2,BCov3)
+        #assert np.allclose(WCov2,WCov3)
+        #assert np.allclose(mu2, mu3)
+                        
+        # Bi and Wi are the between and within covariance matrices and mu is the global (weighted) mean
+        Bi, Wi, mu = compute_2cov_plda_model(x, speaker_ids, weights, init_params.get('plda_em_its',0))
+        
         # Equations (14) and (16) in Cumani's paper 
         # Note that the paper has an error in the formula for k (a 1/2 missing before k_tilde) 
-        # that are fixed in the equations below
-        Bmu               = np.dot(B,mu)
-        L_tilde           = np.linalg.inv(B+2*W)
-        G_tilde           = np.linalg.inv(B+W)
-        WtGL              = np.dot(W.T,L_tilde-G_tilde)
-        _, logdet_L_tilde = np.linalg.slogdet(L_tilde)
-        _, logdet_G_tilde = np.linalg.slogdet(G_tilde)
-        _, logdet_B       = np.linalg.slogdet(B)       
-        k_tilde           = -2.0*logdet_G_tilde + logdet_L_tilde - logdet_B + np.dot(mu.T, Bmu) 
+        # that is fixed in the equations below
+        # To compute L_tild and G_tilde we use the following equality:
+        # inv( inv(C) + n*inv(D) ) == C @ inv(D + n*C) @ D == C @ solve(D + n*C, D)
+        B              = utils.CholInv(Bi)
+        W              = utils.CholInv(Wi)
+        Bmu            = B @ mu.T
+        L_tilde        = Bi @ np.linalg.solve(Wi + 2*Bi, Wi)
+        G_tilde        = Bi @ np.linalg.solve(Wi + Bi, Wi)
+        WtGL           = W @ (L_tilde-G_tilde)
+        logdet_L_tilde = np.linalg.slogdet(L_tilde)[1]
+        logdet_G_tilde = np.linalg.slogdet(G_tilde)[1]
+        logdet_B       = B.logdet()       
+        k_tilde        = -2.0*logdet_G_tilde + logdet_L_tilde - logdet_B + mu @ Bmu
 
-        k = 0.5 * k_tilde + 0.5 * np.dot(Bmu.T, np.dot(L_tilde - 2*G_tilde, Bmu))
-        L = 0.5 * np.dot(W.T,np.dot(L_tilde,W))
-        G = 0.5 * np.dot(WtGL,W)
-        C = np.dot(WtGL,Bmu)[:,np.newaxis]
+        k = 0.5 * k_tilde + 0.5 * Bmu.T @ (L_tilde - 2*G_tilde) @ Bmu
+        L = 0.5 * (W @ (W @ L_tilde)).T
+        G = 0.5 * (W @ WtGL).T
+        C = (WtGL @ Bmu)
 
-        if init_params.get('norm_plda_params'):
-            # Divide all params by k so that we get rid of that scale at init
-            # It will be compensated by the calibration params anyway. This is to make 
-            # the params more comparable across different initializations so that
-            # regularization works similarly.
-            L /= k
-            G /= k
-            C /= k
-            k = 1.0
-
-        state_dict = {'L': L, 'G': G, 'C': C, 'k': k}
+        state_dict = {'L': L, 'G': G, 'C': C, 'k': k.squeeze()}
 
         utils.replace_state_dict(self, state_dict)
 
@@ -490,12 +494,9 @@ class Affine(nn.Module):
         if self.has_bias is False:
             raise Exception("Cannot initialize this component with init_with_lda because it was created with bias=False")
 
-        bbs = init_params.get('balance_by_speaker_lda', init_params.get('balance_by_speaker'))
-        bbd = init_params.get('balance_by_domain_lda', init_params.get('balance_by_domain'))
-        
-        weights = compute_sample_weights(class_ids, sec_ids, bbs, bbd)
-                
-        BCov, WCov, GCov, mu, mu_per_class = compute_lda_model(x, class_ids, weights)
+        weights = compute_class_weights(class_ids, sec_ids, init_params.get('balance_by_domain'))
+
+        BCov, WCov, GCov, mu, mu_per_class, _ = compute_lda_model(x, class_ids, weights)
 
         if gaussian_backend:
             W = linalg.solve(WCov, mu_per_class.T, sym_pos=True)
@@ -512,10 +513,10 @@ class Affine(nn.Module):
                 W = evecs[:,-lda_dim:]
 
             # Normalize each dimension so that output features will have variance 1.0
-            W = W.dot(np.diag(1. / np.sqrt(np.diag(W.T.dot(GCov).dot(W)))))
+            W = W @ (np.diag(1. / np.sqrt(np.diag(W.T @ GCov @ W))))
 
             # Finally, estimate the shift so that output features have mean 0.0 
-            mu = np.matmul(mu, W)
+            mu = mu @ W
             b = -mu
 
         utils.replace_state_dict(self, {'W': W, 'b': b})
@@ -570,7 +571,83 @@ class SimpleNN(nn.Module):
         self.outlayer.init_random(W_param, b_param, init_type)
 
 
-def compute_lda_model(x, class_ids, weights):
+
+def compute_2cov_plda_model(x, class_ids, class_weights, em_its=0):
+    """ Follows the "EM for SPLDA" document from Niko Brummer:
+    https://sites.google.com/site/nikobrummer/EMforSPLDA.pdf
+    """
+
+    BCov, WCov, GCov, mu, muc, stats = compute_lda_model(x, class_ids, class_weights)
+    W = utils.CholInv(WCov)
+    v, e = linalg.eig(BCov)
+    V = e * np.sqrt(np.real(v))
+    
+    def mstep(R, T, S, n_samples):
+        V = (utils.CholInv(R) @  T).T
+        Winv = 1/n_samples * (S-V@T)
+        W = utils.CholInv(Winv)
+        return V, W, Winv
+
+    def estep(stats, V, W):
+        VtW  = (W @ V).T
+        VtWV = VtW @ V
+        VtWf = VtW @ stats.F.T
+        y_hat = np.zeros_like(stats.F).T
+        R = np.zeros_like(V)
+        llk = 0.0
+        for n in np.unique(stats.N):
+            idxs = np.where(stats.N == n)[0]
+            L = n * VtWV + np.eye(V.shape[0])
+            Linv = utils.CholInv(L)
+            y_hat[:,idxs] = Linv @ VtWf[:,idxs]
+            # The expression below is a robust way for solving 
+            # yy_sum = len(idxs)*Linv + np.dot(y_hat[:, idxs], y_hat[:, idxs].T)
+            # while avoiding doing the inverse of L which can create numerical issues
+            n_spkrs = np.sum(stats.weights[idxs])
+            yy_sum = np.linalg.solve(L, n_spkrs * np.eye(V.shape[0]) + L @ y_hat[:, idxs] @ (y_hat[:, idxs].T * stats.weights[idxs]))
+            R += n*yy_sum
+            llk += 0.5 * n_spkrs * Linv.logdet()
+        T = y_hat @ (stats.F * stats.weights)
+        llk += 0.5*np.trace(T @ VtW.T) + 0.5 * np.sum(stats.N*stats.weights) * W.logdet() - 0.5 * np.trace(W @ stats.S)
+        return R, T, llk/np.sum(stats.N*stats.weights)
+
+    prev_llk = 0.0
+    for it in range(em_its):
+        R, T, llk = estep(stats, V, W)
+        V, W, WCov = mstep(R, T, stats.S, np.sum(stats.N*stats.weights))
+        print("EM it %d LLK = %.5f (+%.5f)" % (it, llk, llk-prev_llk))
+        prev_llk = llk 
+    
+    BCov = V @ V.T
+
+    return BCov, WCov, np.atleast_2d(mu)
+
+def compute_stats(x, class_ids, class_weights):
+    # Zeroth, first and second order stats per speaker, considering that
+    # each speaker is weighted by the provided weights
+    stats     = utils.AttrDict(dict())
+    nsamples  = class_ids.shape[0]
+    classmat  = coo_matrix((np.ones(nsamples), (class_ids, np.arange(nsamples)))).tocsr()
+    stats.weights = np.atleast_2d(class_weights).T
+
+    # Global mean, considering that each speaker's data should be 
+    # multiplied by the corresponding weight for that speaker
+    sample_weights = stats.weights[class_ids]
+    stats.mu       = np.array(sample_weights.T @ x) / np.sum(sample_weights) 
+
+    # N and F are stats per speaker, weights are not involved in the computation of those. 
+    # S, on the other hand, is already a sum over speakers so the sample from each speaker
+    # has to be weighted by the corresponding weight
+    xcent     = x - stats.mu
+    xcentw    = xcent * sample_weights
+    stats.N   = np.array(classmat.sum(1)) 
+    stats.F   = np.array(classmat @ xcent)
+    stats.S   = xcent.T @ xcentw
+
+    return stats
+
+
+def compute_lda_model(x, class_ids, class_weights):
 
     # Simpler code using sklearn. We are not using this because it does not allow for weights
     # lda = discriminant_analysis.LinearDiscriminantAnalysis(store_covariance=True)
@@ -579,48 +656,51 @@ def compute_lda_model(x, class_ids, weights):
     # BCov = np.cov(x.T, bias=1) - WCov
     # mu = np.mean(x, axis=0)
     # GCov should be the same as np.cov(x.T,  bias=1)
-        
-    nsamples    = class_ids.shape[0]
-    weights    /= np.sum(weights)/float(nsamples)
-    weightsdiag = dia_matrix((weights,0),shape=(nsamples,nsamples))
-    classmat    = coo_matrix((np.ones(nsamples), (class_ids, np.arange(nsamples)))).tocsr()
-    classmatw   = classmat.dot(weightsdiag) # Matrix with one row per speaker and one col per sample, with the weights as entries
-    mu          = np.array(weights.dot(x)) / float(nsamples) # Global mean
-    counts      = np.array(classmatw.sum(1)) # Counts by class
-    muc         = np.array(classmatw.dot(x)) / counts # Means by class
-    mucCS       = (muc - mu) * np.sqrt(counts) # Means by class, centered and scaled
-    BCov        = mucCS.T.dot(mucCS) / nsamples # Between class covariance
-    xCS         = np.multiply((x - mu).T, np.sqrt(weights)).T # Samples centered and scaled
-    GCov        = np.dot(xCS.T,xCS) / nsamples
-    WCov        = GCov - BCov
 
-    return BCov, WCov, GCov, mu, muc
+    stats = compute_stats(x, class_ids, class_weights)
+
+    # Once we have the stats, we do not need x or class_ids any more (we still do need the class weights)
+    mu    = stats.mu
+    muc   = stats.F / stats.N + stats.mu # Means by class (not centered)
+    
+    # Matrix with the weights per speaker in the diagonal
+    n_spkrs = stats.N.shape[0]
+    weightsdia = dia_matrix((class_weights,0),shape=(n_spkrs, n_spkrs))
+
+    # BCov and GCov are computed by weighting the contribution of each speaker with 
+    # the provided weights
+    Ntot  = np.sum(np.multiply(stats.N, stats.weights))
+    Fs    = stats.F / np.sqrt(stats.N) 
+    BCov  = Fs.T @ (Fs * stats.weights) / Ntot
+    GCov  = stats.S / Ntot
+    WCov  = GCov - BCov
+
+    return BCov, WCov, GCov, mu.squeeze(), muc, stats
 
 
-def compute_sample_weights(speaker_ids, domain_ids, balance_by_speaker, balance_by_domain):
 
-    weights = np.ones_like(speaker_ids, dtype=float)
-    doms = np.unique(domain_ids)
+def compute_class_weights(speaker_ids, domain_ids, balance_by_domain=False):
 
-    if balance_by_domain:
-        if balance_by_domain == 'with_spk_count':
-            dom_weight = np.ones_like(doms, dtype=float)
-            for d in doms:
-                dom_weight[d] = 1.0/len(np.unique(speaker_ids[domain_ids==d]))
+    unique_sids = np.unique(speaker_ids)
+    unique_doms = np.unique(domain_ids)
+    
+    # The weight for each domain is given by the inverse of the number of speakers for that domain    
+    dom_weight = np.ones_like(unique_doms, dtype=float)
+    for d in unique_doms:
+        if balance_by_domain:
+            # If all domains have the same number of speakers, then all weights are 1.0
+            dom_weight[d] = len(unique_sids)*1.0/len(np.unique(speaker_ids[domain_ids==d]))/len(unique_doms)
         else:
-            dom_weight = 1.0/np.bincount(domain_ids) 
-        weights *= dom_weight[domain_ids]
-        
-    if balance_by_speaker:
-        spk_weight = 1.0/np.bincount(speaker_ids) 
-        weights *= spk_weight[speaker_ids]
+            # Dummy weight of 1 for all domains
+            dom_weight[d] = 1.0
 
-    sum_weights_per_dom = np.ones_like(doms, dtype=float)
-    for d in doms:
-        sum_weights_per_dom[d] = np.sum(weights[domain_ids==d])
+    # The weight for each speaker is given by the weight for the domain to which it belongs.
+    # This assumes each speaker belongs to a single domain, which will mostly be the case.
+    # Else, we'll just assign a weight that corresponds to one of its domains.
+    spk_weight = np.ones_like(unique_sids, dtype=float)
+    for s in unique_sids:
+        spk_weight[s] = dom_weight[domain_ids[np.where(speaker_ids==s)[0][0]]]
 
-    print("Num samples per domain: %s"%np.bincount(domain_ids))
-    print("Sum of weights per domain: %s"%(sum_weights_per_dom/np.sum(sum_weights_per_dom)))
+    print("Weights per domain: %s"%dom_weight)
 
-
-    return weights
+    return spk_weight

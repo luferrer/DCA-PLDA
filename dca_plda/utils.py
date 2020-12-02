@@ -8,6 +8,8 @@ import re
 import modules 
 import os
 import scores as scr
+from numpy.linalg import cholesky as chol
+from scipy.linalg import solve_triangular
 
 def train(model, loader, optimizer, epoch, config, debug_dir=None):
     
@@ -443,3 +445,29 @@ def ismember(a, b):
     b = dict((e, i) for i, e in enumerate(b))
     rindex = np.array([b.get(k, -1) for k in a])
     return rindex != -1, rindex
+
+
+class CholInv:
+    """
+    Ci = CholInv(C) conveniently encapsulates the Cholesky transform of C, so that
+    Ci @ RHS is equivalent to solve(C,RHS).
+    """
+    def __init__(self,C):
+        self.L = chol(C)       # left Cholesky factor of C (lower triangular)
+        self.C = C
+        
+    def __matmul__(self,RHS):
+        """
+        Does the equivalent of solve (C,RHS), using the stored Cholesky 
+        transform. Can be conveniently invoked as self @ RHS.
+        """
+        L = self.L
+        return solve_triangular(L, solve_triangular(L, RHS, trans=0, lower=True, check_finite=False),
+                                lower=True, trans=1, check_finite=False)
+    
+    def logdet(self):
+        """
+        log determinant of inv(C) = - log determinant of C
+        """
+        return -2*np.log(np.diag(self.L)).sum()
+

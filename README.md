@@ -10,7 +10,11 @@ We have found this system to provide great out-of-the-box performance across a v
 
 The code included in this repository can replicate the results in the paper above, but it can also implement other functionality that is not part of that paper. We are currently in the process of preparing a new publication with new results and further analysis.
 
+Finally, the code can be used to train and evaluate a standard PLDA pipeline. Basically, the initial model before any training epochs is identical to a PLDA system, with an option for weighting the samples during training to compensate for imbalance across training domains.
+
 This code was written by Luciana Ferrer. The pre-computed embeddings provided to run the example were computed using SRI's software and infrastructure. We thank Niko Brummer for his help with the calibration code in the calibration.py file.
+
+We will appreciate any feedback about the code or the approaches. Also, please let us know if you find bugs.
 
 
 ## How to install
