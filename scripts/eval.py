@@ -16,6 +16,7 @@ parser.add_argument('--min_dur',  help="Minimum duration in seconds below which 
 parser.add_argument('--keylist',  help='List of keys for scoring. If not provided, only the scores are printed in the out_dir.', default=None)
 parser.add_argument('--ptar',     help='Prior for Cllr and DCF computation if keylist is provided.', default=0.01, type=float)
 parser.add_argument('--set',      help='Name for the set, to be used in the results file.', default=None)
+parser.add_argument('--raw',      help='Output the raw scores, before the calibration stages (used for analysis).', default=False, action='store_true')
 parser.add_argument('model',      help='Path to the model to be used for evaluation.')
 parser.add_argument('embeddings', help='Path to the npz file with development embeddings.')
 parser.add_argument('enroll_map', help='Map from enrollment ids (first column) to the ids used in the embeddings file (second column).\
@@ -46,7 +47,7 @@ model = load_model(opt.model, device)
 print("Loaded model from %s"%opt.model)
     
 ###### Generate the scores
-scores = evaluate(model, dataset, emap, tmap, min_dur=opt.min_dur)
+scores = evaluate(model, dataset, emap, tmap, min_dur=opt.min_dur, raw=opt.raw)
 scores.save("%s/scores.h5"%opt.out_dir)
 
 if opt.keylist is not None:

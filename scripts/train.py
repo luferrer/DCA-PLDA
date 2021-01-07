@@ -12,7 +12,7 @@ from data import *
 from modules import *
 from utils import *
 from scores import *
-
+from calibration import logregCal
 
 default_config = {
     'architecture':{
@@ -30,7 +30,8 @@ default_config = {
         'num_epochs': 50,
         'num_samples_per_spk': 2,
         'num_batches_per_epoch': 1000,
-        'balance_batches_by_domain': False}}
+        'balance_batches_by_domain': False,
+        'compute_ave_model': False}}
 
 
 def check_if_best(best_checkpoint, best_dev_loss, best_epoch, checkpoint, dev_loss, epoch):
@@ -43,7 +44,7 @@ def check_if_best(best_checkpoint, best_dev_loss, best_epoch, checkpoint, dev_lo
     return best_checkpoint, best_epoch, best_dev_loss
 
 
-def test_and_save(model, data_dict, epoch, optimizer, lr_scheduler, out_dir, trn_loss, ptar, loss_type):
+def test_model(model, data_dict, model_name, ptar, loss_type, print_min_loss=False):
     # Compute the loss for each of the devsets. The validation loss will be the average over all devsets
     av_loss = 0
     for name, info in data_dict.items():
@@ -51,13 +52,19 @@ def test_and_save(model, data_dict, epoch, optimizer, lr_scheduler, out_dir, trn
         scores = evaluate(model, info['dataset'], info['emap'], info['tmap'])
         # Since the key mask was created to be aligned to the emap and tmap, the score_mat
         # is already aligned to this mask
-        loss = compute_loss(scores.score_mat, mask=mask, ptar=ptar, loss_type=loss_type)
-        print("Epoch %04d, loss on dev set %s = %f"%(epoch, name, loss))
+        loss, llrs, labels = compute_loss(scores.score_mat, mask=mask, ptar=ptar, loss_type=loss_type, return_info=True)
+        if print_min_loss:
+            tar = llrs[labels==1].detach().cpu().numpy()
+            non = llrs[labels==0].detach().cpu().numpy()
+            cal = logregCal(tar, non, ptar)
+            min_loss = cross_entropy(cal(tar), cal(non), ptar)
+            print("%s, loss on dev set %s = %f  min = %f"%(model_name, name, loss, min_loss))
+        else:
+            print("%s, loss on dev set %s = %f"%(model_name, name, loss))
         av_loss += loss
 
     av_loss /= len(data_dict)
-    outfile = save_checkpoint(model, out_dir, epoch, trn_loss, av_loss, optimizer, lr_scheduler)
-    return av_loss, outfile
+    return av_loss
 
 def load_data_dict(table, device):
     data_dict = dict()
@@ -82,6 +89,7 @@ parser.add_argument('--configs',      help='List of configuration files to load.
 parser.add_argument('--mods',         help='List of values to overwride config parameters. Example: training.num_epochs=20,architecture.lda_dim=200', default=None)
 parser.add_argument('--init_subset',  help='Subset of the train files to be used for initialization. For default, the files in trn_metafile are used.', default=None)
 parser.add_argument('--restart',      help='Restart training from last available model.', action='store_true')
+parser.add_argument('--print_min_loss', help='Print the min loss for each dev set at each epoch.', action='store_true')
 parser.add_argument('trn_embeddings', help='Path to the npz file with training embeddings.')
 parser.add_argument('trn_metafile',   help='Path to the metadata for the training samples (all samples listed in this file should be present in the embeddings file).')
 parser.add_argument('dev_table',      help='Path to a table with one dev set per line, including: name, npz file with embeddings, key file, and durations file (can be missing if not using duration-dependent calibration).')
@@ -146,7 +154,7 @@ if config_trn.get("learning_rate_params") is not None:
 
 
 # Load the last available model if restart is set or initialize with data if no previous checkpoint is available
-last_checkpoint,  last_epoch,  last_dev_loss  = find_checkpoint(opt.out_dir)
+last_checkpoint, last_epoch, last_dev_loss = find_checkpoint(opt.out_dir)
 
 if opt.restart and last_checkpoint is not None:
 
@@ -172,7 +180,9 @@ else:
         init_subset = None
 
     trn_loss = model.init_params_with_data(trn_dataset, config_trn, device=device, subset=init_subset)
-    dev_loss, checkpoint = test_and_save(model, dev_data_dict, 0, optimizer, lr_scheduler, opt.out_dir, trn_loss, config_trn.ptar, config_trn.loss)
+    dev_loss = test_model(model, dev_data_dict, "Epoch 0000", config_trn.ptar, config_trn.loss, print_min_loss=opt.print_min_loss)
+    checkpoint = save_checkpoint(model, opt.out_dir, 0, trn_loss, dev_loss, optimizer, lr_scheduler)
+
     best_checkpoint,  best_epoch,  best_dev_loss  = checkpoint, 0, dev_loss
     first_checkpoint, first_epoch, first_dev_loss = checkpoint, 0, dev_loss
 
@@ -185,7 +195,8 @@ loader = TrialLoader(trn_dataset, device, seed=opt.seed, batch_size=config_trn.b
 start_epoch = 1 if not opt.restart else last_epoch+1
 for epoch in range(start_epoch, num_epochs + 1):
     trn_loss = train(model, loader, optimizer, epoch, config_trn, debug_dir=opt.out_dir if opt.debug else None)
-    dev_loss, checkpoint = test_and_save(model, dev_data_dict, epoch, optimizer, lr_scheduler, opt.out_dir, trn_loss, config_trn.ptar, config_trn.loss)
+    dev_loss = test_model(model, dev_data_dict, "Epoch %04d"%epoch, config_trn.ptar, config_trn.loss, print_min_loss=opt.print_min_loss)
+    checkpoint = save_checkpoint(model, opt.out_dir, epoch, trn_loss, dev_loss, optimizer, lr_scheduler)
     best_checkpoint, best_epoch, best_dev_loss = check_if_best(best_checkpoint, best_dev_loss, best_epoch, checkpoint, dev_loss, epoch)
 
     if lr_scheduler is not None:
@@ -199,5 +210,22 @@ shutil.copy(checkpoint,       '%s/last_epoch_%04d_devloss_%.4f.pth' % (opt.out_d
 shutil.copy(best_checkpoint,  '%s/best_epoch_%04d_devloss_%.4f.pth' % (opt.out_dir, best_epoch, best_dev_loss))
 shutil.copy(first_checkpoint, '%s/first_epoch_%04d_devloss_%.4f.pth' % (opt.out_dir, first_epoch, first_dev_loss))
 
+if config_trn.compute_ave_model:
+    # Average the best/first N models and retest. Stop when the performance starts degrading
+    checkpoints, _, devlosses = find_checkpoint(opt.out_dir, config_trn.compute_ave_model, n=num_epochs)
+    cur_ave_dev_loss = devlosses[0]
+    prev_ave_dev_loss = 100000
+    load_checkpoint(checkpoints[0], model, device)
+    print("Starting averaging of models with %s"%checkpoints[0])
+    n = 1
+    while cur_ave_dev_loss < prev_ave_dev_loss:
+        print("Updating average with %s"%checkpoints[n])
+        update_model_with_weighted_average(model, checkpoints[n], device, n)
+        prev_ave_dev_loss = cur_ave_dev_loss
+        cur_ave_dev_loss = test_model(model, dev_data_dict, "Average %s n=%03d"%(config_trn.compute_ave_model,n), config_trn.ptar, config_trn.loss, print_min_loss=opt.print_min_loss)
+        print("New devloss = %f"%cur_ave_dev_loss)
+        n += 1
+    save_checkpoint(model, opt.out_dir, dev_loss=dev_loss, name="ave_%s"%config_trn.compute_ave_model)
+    
 Path("%s/DONE"%opt.out_dir).touch()
 

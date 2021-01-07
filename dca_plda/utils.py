@@ -14,7 +14,7 @@ from scipy.linalg import solve_triangular
 def train(model, loader, optimizer, epoch, config, debug_dir=None):
     
     model.train()
-    total_loss = total_regt = total_batches = 0
+    total_loss = total_regt = total_regl = total_batches = 0
     freq = 100
 
     if debug_dir:
@@ -38,10 +38,21 @@ def train(model, loader, optimizer, epoch, config, debug_dir=None):
         # I want to do the clipping on the full gradient rather than only on the 
         # part corresponding to the loss since this seems to work better.
         # The loss_scale is there for backward compatibility with my old TF code.
-        loss = modules.compute_loss(output, metadata=metadata, ptar=config.ptar, loss_type=config.loss) 
+        loss, llrs, labels = modules.compute_loss(output, metadata=metadata, ptar=config.ptar, loss_type=config.loss, return_info=True) 
         loss_scale = config.batch_size * 0.056 
-        regt = l2_reg_term(model.named_parameters(), config.l2_reg_dict)
-        regloss = loss_scale * loss + regt 
+        regt, regl = 0.0, 0.0
+
+        l2_reg_dict = config.get("l2_reg_dict")
+        if l2_reg_dict is not None:
+            regt = l2_reg_term(model.named_parameters(), config.l2_reg_dict)
+        
+        llr_reg_dict = config.get("llr_reg")
+        if llr_reg_dict is not None:
+            # Regularize the llrs directly as proposed in "Gradient Starvation:A Learning Proclivity in Neural Networks" 
+            # by Pezeshki et al
+            regl = llr_reg_dict['weight'] * torch.pow(llrs-llr_reg_dict.get('offset',0.0), 2).sum() 
+        
+        regloss = loss_scale * loss + regt + regl
         regloss.backward()
         if config.get('max_norm') is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_norm)
@@ -49,11 +60,16 @@ def train(model, loader, optimizer, epoch, config, debug_dir=None):
 
         total_loss += loss
         total_regt += regt
+        total_regl += regl
         total_batches += 1
         if batch_idx % freq == 0 and batch_idx>0:
-            print("  Epoch %04d, batch %04d, ave loss %f, ave reg term %f"%(epoch, batch_idx, total_loss/total_batches, total_regt/total_batches/loss_scale))
+            print("  Epoch %04d, batch %04d, ave loss %f, ave l2 reg term %f, ave logit reg term %f"%
+                (epoch, batch_idx, total_loss/total_batches, 
+                total_regt/total_batches/loss_scale,
+                total_regl/total_batches/loss_scale))
     
-    print("Finished Epoch %04d, ave loss %f, ave reg term %f"%(epoch, total_loss/total_batches, total_regt/total_batches/loss_scale))
+    print("Finished Epoch %04d, ave loss %f, ave l2 reg term %f, ave logit reg term %f"%
+        (epoch, total_loss/total_batches, total_regt/total_batches/loss_scale, total_regl/total_batches/loss_scale))
 
     if debug_dir:
         batches_file.close()
@@ -61,7 +77,7 @@ def train(model, loader, optimizer, epoch, config, debug_dir=None):
     return total_loss/total_batches
 
 
-def evaluate(model, dataset, emap, tmap, min_dur=0):
+def evaluate(model, dataset, emap, tmap, min_dur=0, raw=False):
     """ Evaluate the model on the embeddings corresponding to emap and tmap.
     The code assumes that tmap only has single-session test models.
     For the multi-session enrollment models, we simply create single-session trials
@@ -93,7 +109,7 @@ def evaluate(model, dataset, emap, tmap, min_dur=0):
             scoresk = torch.zeros(len(eidsk), len(tids))  
             for i in np.arange(k):
                 eidx = emapk[i]
-                scoreski = model.score(data[eidx], data[tidx], durs[eidx], durs[tidx])
+                scoreski = model.score(data[eidx], data[tidx], durs[eidx], durs[tidx], raw=raw)
                 scoreski[durs[eidx]<min_dur, :] = 0
                 scoreski[:, durs[tidx]<min_dur] = 0
                 scoresk += scoreski
@@ -158,16 +174,22 @@ def print_graph(model, dataset, device, outdir):
             print("  ", name, param.shape)
 
 
-def save_checkpoint(model, outdir, epoch, trn_loss=None, dev_loss=None, optimizer=None, scheduler=None, name="model"):
+def save_checkpoint(model, outdir, epoch=None, trn_loss=None, dev_loss=None, optimizer=None, scheduler=None, name="model"):
     
     if trn_loss is not None:
         lr = optimizer.param_groups[0]['lr']
         outfile = '%s/%s_epoch_%04d_lr_%8.6f_trnloss_%.4f_devloss_%.4f.pth' % (outdir, name, epoch, lr, trn_loss, dev_loss)
     else:   
         if dev_loss is not None:
-            outfile = '%s/%s_epoch_%04d_devloss_%.4f.pth' % (outdir, name, epoch, dev_loss)
+            if epoch is not None:
+                outfile = '%s/%s_epoch_%04d_devloss_%.4f.pth' % (outdir, name, epoch, dev_loss)
+            else:
+                outfile = '%s/%s_devloss_%.4f.pth' % (outdir, name, dev_loss)
         else:
-            outfile = '%s/%s_epoch_%04d.pth' % (outdir, name, epoch)
+            if epoch is not None:
+                outfile = '%s/%s_epoch_%04d.pth' % (outdir, name, epoch)
+            else:
+                outfile = '%s/%s.pth' % (outdir, name)
 
     print("Saving model in %s"%outfile)
     save_dict = {'model': model.state_dict(), 
@@ -199,6 +221,16 @@ def load_checkpoint(file, model, device, optimizer=None, scheduler=None):
         optimizer.load_state_dict(loaded_dict['optimizer'])
     if scheduler:
         scheduler.load_state_dict(loaded_dict['scheduler'])
+
+
+def update_model_with_weighted_average(model, checkpoint, device, n):
+
+    new_params = torch.load(checkpoint, map_location=device)['model']
+    prev_params = model.state_dict()
+    upd_params = dict()
+    for p in prev_params.keys():
+        upd_params[p] = (prev_params[p]*n + new_params[p])/(n+1)
+    model.load_state_dict(upd_params)
 
 
 def replace_state_dict(model, sdict):
@@ -304,34 +336,37 @@ def print_config(config, outfile, has_sections=True):
             print("  "+l.rstrip())
 
 
-def find_checkpoint(dir, which="last"):
-    # Find the last available checkpoint in directory dir
-    checkpoints = np.sort(glob.glob("%s/model*.pth"%dir))
+def find_checkpoint(dir, which="last", n=1):
+    """ Find the first/best/last available checkpoints in directory dir.
+    If n>1, it returns a list of first/best/last checkpoints, their epochs and devlosses."""
+
+    all_checkpoints = np.sort(glob.glob("%s/model*.pth"%dir))
     mindevloss = 1000000000
 
-    if len(checkpoints) > 0:
+    if len(all_checkpoints) > 0:
 
         if which == "last":
-            checkpoint = checkpoints[-1]
+            checkpoints = all_checkpoints[-n:]
         elif which == "first":
-            checkpoint = checkpoints[0]
+            checkpoints = all_checkpoints[0:n]
         elif which == "best":
-            besti = 0
-            for i, checkp in enumerate(checkpoints):
-                devloss = float(re.sub(".pth", "", re.sub(".*_devloss_","",checkp)))
-                if devloss < mindevloss:
-                    mindevloss = devloss
-                    besti = i
-            checkpoint = checkpoints[besti]
+            all_devlosses = np.empty(len(all_checkpoints))
+            for i, checkp in enumerate(all_checkpoints):
+                all_devlosses[i] = float(re.sub(".pth", "", re.sub(".*_devloss_","",checkp)))
+            sorti = np.argsort(all_devlosses)
+            checkpoints = all_checkpoints[sorti[0:n]]
 
-        epoch = re.sub("_.*", "", re.sub(".*_epoch_","",checkpoint))
-        devloss = float(re.sub(".pth", "", re.sub(".*_devloss_","",checkpoint)))
+        epochs = [int(re.sub("_.*", "", re.sub(".*_epoch_","",ch))) for ch in checkpoints]
+        devlosses = [float(re.sub(".pth", "", re.sub(".*_devloss_","",ch))) for ch in checkpoints]
     else:
-        checkpoint = None
-        epoch = 0
-        devloss = mindevloss
+        checkpoints = [None]
+        epochs = [0]
+        devlosses = [mindevloss]
 
-    return checkpoint, int(epoch), devloss
+    if n==1:
+        return checkpoints[0], epochs[0], devlosses[0]
+    else:
+        return checkpoints, epochs, devlosses
 
 
 class AttrDict(dict):

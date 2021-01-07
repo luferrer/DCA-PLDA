@@ -23,9 +23,9 @@ def compute_loss(llrs, metadata=None, ptar=0.01, mask=None, loss_type='cross_ent
         assert metadata is not None
         same_spk, valid = utils.create_scoring_masks(metadata)
 
-    # Shift the llrs to convert them to posteriors
+    # Select the valid llrs and shift them to convert them to logits
+    llrs   = llrs[valid]
     logits = llrs + logit(ptar)
-    logits = logits[valid]
     labels = same_spk[valid]
     labels = labels.type(logits.type())
 
@@ -101,7 +101,7 @@ class DCA_PLDA_Backend(nn.Module):
         return self.score(x, dure=durations)
 
 
-    def score(self, xe, xt=None, dure=None, durt=None, si_only=False):
+    def score(self, xe, xt=None, dure=None, durt=None, si_only=False, raw=False):
         # Same as the forward method but it allows for assymetric scoring where the rows and columns
         # of the resulting score file corresponds to two different sets of data
 
@@ -135,7 +135,7 @@ class DCA_PLDA_Backend(nn.Module):
 
             scrs = self.plda_stage.score(x2e, x2t)
             llrs = self.cal_stage.calibrate(scrs, dure, sie, durt, sit)            
-            return llrs
+            return llrs if raw is False else scrs
 
 
     def init_params_with_data(self, dataset, config, device=None, subset=None):
@@ -153,7 +153,11 @@ class DCA_PLDA_Backend(nn.Module):
             domain_ids  = meta['domain_id']
             x_torch = utils.np_to_torch(x, device)
             
-            self.lda_stage.init_with_lda(x, speaker_ids, init_params, sec_ids=domain_ids)
+            if init_params.get("random"):
+                self.lda_stage.init_random(init_params.get('stdev',0.1))
+            else:
+                self.lda_stage.init_with_lda(x, speaker_ids, init_params, sec_ids=domain_ids)
+
             x2_torch = self.lda_stage(x_torch)
             x2 = x2_torch.cpu().numpy()
 
@@ -165,7 +169,11 @@ class DCA_PLDA_Backend(nn.Module):
                     si_input_torch = x2_torch
                     si_input = x2
 
-                self.si_stage1.init_with_lda(si_input, speaker_ids, init_params, sec_ids=domain_ids, complement=True)
+                if init_params.get("random"):
+                    self.si_stage1.init_random(init_params.get('stdev',0.1))
+                else:
+                    self.si_stage1.init_with_lda(si_input, speaker_ids, init_params, sec_ids=domain_ids, complement=True)
+
                 s2_torch = self.si_stage1(si_input_torch)
                     
                 if init_params.get('init_si_stage2_with_domain_gb', False):
@@ -176,17 +184,24 @@ class DCA_PLDA_Backend(nn.Module):
                     self.si_stage2.init_with_lda(s2_torch.cpu().numpy(), domain_ids, init_params, sec_ids=speaker_ids, gaussian_backend=True)
     
                 else:
+                    # This is the only component that is initialized randomly unless otherwise indicated by the variable "init_si_stage2_with_domain_gb"
                     self.si_stage2.init_random(init_params.get('w_init', 0.5), init_params.get('b_init', 0.0), init_params.get('type', 'normal'))
 
                 if hasattr(self,'shift_selector'):
                     # Initialize the shifts as the mean of the lda outputs weighted by the si
                     si_torch = self.si_stage2(s2_torch)
                     si = si_torch.cpu().numpy()
-                    self.shift_selector.init_with_weighted_means(x2, si)
+                    if init_params.get("random"):
+                        self.shift_selector.init_random(init_params.get('stdev',0.1))
+                    else:
+                        self.shift_selector.init_with_weighted_means(x2, si)
                     x2_torch -= self.shift_selector(si_torch)
                     x2 = x2_torch.cpu().numpy()
 
-            self.plda_stage.init_with_plda(x2, speaker_ids, init_params, domain_ids=domain_ids)
+            if init_params.get("random"):
+                self.plda_stage.init_random(init_params.get('stdev',0.1))
+            else:    
+                self.plda_stage.init_with_plda(x2, speaker_ids, init_params, domain_ids=domain_ids)
 
             # Since the training data is usually large, we cannot create all possible trials for x3.
             # So, to create a bunch of trials, we just create a trial loader with a large batch size.
@@ -199,7 +214,10 @@ class DCA_PLDA_Backend(nn.Module):
             same_spk_torch, valid_torch = utils.create_scoring_masks(meta_batch)
             scrs, same_spk, valid = [v.detach().cpu().numpy() for v in [scrs_torch, same_spk_torch, valid_torch]]
 
-            self.cal_stage.init_with_logreg(scrs, same_spk, valid, config.ptar, std_for_mats=init_params.get('std_for_cal_matrices',0))
+            if init_params.get("random"):
+                self.cal_stage.init_random(init_params.get('stdev',0.1))
+            else:
+                self.cal_stage.init_with_logreg(scrs, same_spk, valid, config.ptar, std_for_mats=init_params.get('std_for_cal_matrices',0))
 
             dummy_durs = torch.ones(scrs.shape[0]).to(device) 
             dummy_si = torch.zeros(scrs.shape[0], self.si_dim).to(device)
@@ -272,6 +290,32 @@ class CA_Calibrator(nn.Module):
         
         if self.dur_rep == 'log':
             durs = torch.log(durations.unsqueeze(1))
+        elif self.dur_rep == 'log2':
+            durs = torch.log(durations.unsqueeze(1))
+            durs = torch.cat([durs, durs*durs], 1)
+        elif self.dur_rep == 'idlog':
+            durs = durations.unsqueeze(1)
+            durs = torch.cat([durs/100, torch.log(durs)], 1)
+        elif self.dur_rep == 'siglog':
+            durs = torch.log(durations.unsqueeze(1))
+            # Take the log durs and multiplied them by a sigmoid centered a some value
+            # and then again with a rotated sigmoid
+            scale  = self.config.get("duration_sigmoid_scale")
+            centers = np.log(self.dur_thresholds)
+            fs = []
+            prev_sig = 0
+            for c in centers:
+                sigf = torch.sigmoid(-scale*(durs-c)) 
+                sig = sigf - prev_sig
+                fs.append(durs*sig)
+                prev_sig = sigf
+            sig = 1-sigf
+            fs.append(durs*sig)
+            durs = torch.cat(fs, 1)
+            # Simple version for a single center. 
+            #    sig1 = torch.sigmoid(scale*(durs-center))
+            #sig2 = 1.0-sig1
+            #durs = torch.cat([durs*sig1, durs*sig2], 1)
         else:
             durs_disc = self._bucketize(durations, self.dur_thresholds)
             durs_onehot = nn.functional.one_hot(durs_disc, num_classes=len(self.dur_thresholds)+1).type(torch.get_default_dtype())
@@ -321,6 +365,22 @@ class CA_Calibrator(nn.Module):
             scores = alpha_si*scores + beta_si
 
         return scores
+
+
+    def init_random(self, std):
+
+        if self.is_durdep:
+            # Dur-dep calibration (might also have an si-dependent stage)
+            self.durdep_alpha.init_random(std)
+            self.durdep_beta.init_random(std)
+
+        elif not self.is_sidep:
+            # Global calibration
+            nn.init.normal_(self.alpha, 0.0, std)
+            nn.init.normal_(self.beta,  0.0, std)
+        else:
+            self.sidep_alpha.init_random(std)
+            self.sidep_beta.init_random(std)
 
 
     def init_with_logreg(self, scores, same_spk, valid, ptar, std_for_mats=0):
@@ -398,13 +458,15 @@ class Quadratic(nn.Module):
     def init_with_constant(self, k, std_for_mats=0):
         # Initialize k with a given value and, optionally, the 
         # L G and C matrices with a normal
-
-        utils.replace_state_dict(self, {'k': k})
         if std_for_mats>0:
-            nn.init.normal_(self.L, 0.0, std_for_mats)
-            nn.init.normal_(self.G, 0.0, std_for_mats)
-            nn.init.normal_(self.C, 0.0, std_for_mats)
+            self.init_random(std_for_mats)
+        utils.replace_state_dict(self, {'k': k})
 
+    def init_random(self, std):
+        nn.init.normal_(self.k, 0.0, std)
+        nn.init.normal_(self.L, 0.0, std)
+        nn.init.normal_(self.G, 0.0, std)
+        nn.init.normal_(self.C, 0.0, std)
 
     def init_with_plda(self, x, speaker_ids, init_params, domain_ids=None):
         # Compute a PLDA model with the input data, approximating the 
@@ -513,7 +575,8 @@ class Affine(nn.Module):
                 W = evecs[:,-lda_dim:]
 
             # Normalize each dimension so that output features will have variance 1.0
-            W = W @ (np.diag(1. / np.sqrt(np.diag(W.T @ GCov @ W))))
+            if init_params.get('variance_norm_lda', True):
+                W = W @ (np.diag(1. / np.sqrt(np.diag(W.T @ GCov @ W))))
 
             # Finally, estimate the shift so that output features have mean 0.0 
             mu = mu @ W
@@ -521,7 +584,10 @@ class Affine(nn.Module):
 
         utils.replace_state_dict(self, {'W': W, 'b': b})
 
-    def init_random(self, W_param, b_param, init_type):
+    def init_random(self, W_param, b_param=None, init_type="normal"):
+
+        if b_param is None:
+            b_param = W_param
 
         if init_type == 'normal':
             nn.init.normal_(self.W, 0.0, W_param)
