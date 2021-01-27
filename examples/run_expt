@@ -28,7 +28,7 @@ done
 data_dir=./data
 trn_emb=$data_dir/train/embeddings.h5
 trn_meta=$data_dir/train/metadata_$train_set
-ini_meta=$data_dir/train/metadata_$train_set
+ini_meta=$data_dir/train/metadata_${train_set}_chunk00
 train_config1=configs/train/stage1.ini
 train_config2=configs/train/stage2.ini
 
@@ -87,7 +87,7 @@ for stage in stage1 stage2; do
 	mname=`echo $model | sed -e 's,.*epoch_,ep,' -e 's,_.*,,'`
 	dir=$out_dir/$stage/eval_$mname
 	
-	for evalset in sitw.dev sitw.eval heldout_fvcaus voxceleb2; do
+	for evalset in sitw.eval heldout_fvcaus voxceleb2 sitw.eval_4-16sec heldout_fvcaus_4-16sec voxceleb2_4-16sec; do
 
 	    emb=$data_dir/eval/$evalset/embeddings.h5
 	    keys=$data_dir/eval/$evalset/key.lst

@@ -224,8 +224,8 @@ def compute_performance(scores, keylist, outfile, ptar=0.01, setname=None):
     outf = open(outfile, "w")
     ptars = [ptar, 0.5]
  
-    outf.write("%-27s                                            |         Ptar=%4.2f           |         Ptar=%4.2f           |    Ptar=%4.2f    |   Ptar=%4.2f  \n"%(" ",ptars[0],ptars[1], ptars[0], ptars[1]))
-    outf.write("%-27s | #TGT(#missing) #IMP(#missing) |    EER   |   ACLLR MCLLR_LIN MCLLR_PAV |   ACLLR MCLLR_LIN MCLLR_PAV |  ADCF    MDCF   |   ADCF   MDCF  \n"%"Key")
+    outf.write("%-32s                                            |         Ptar=%4.2f           |         Ptar=%4.2f           |    Ptar=%4.2f    |   Ptar=%4.2f  \n"%(" ",ptars[0],ptars[1], ptars[0], ptars[1]))
+    outf.write("%-32s | #TGT(#missing) #IMP(#missing) |    EER   |   ACLLR MCLLR_LIN MCLLR_PAV |   ACLLR MCLLR_LIN MCLLR_PAV |  ADCF    MDCF   |   ADCF   MDCF  \n"%"Key")
 
     for keyf in [l.strip() for l in open(keylist).readlines()]:
         key  = Key.load(keyf)
@@ -245,7 +245,7 @@ def compute_performance(scores, keylist, outfile, ptar=0.01, setname=None):
         min_cllrs_pav = det.min_cllr(ptars, with_pav=True)
         #min_cllrs_pav = [np.nan, np.nan]
         eer = det.eer(from_rocch=True)
-        outf.write("%-27s | %14s %14s |  %6.2f  |  %7.4f  %7.4f  %7.4f  |  %7.4f  %7.4f  %7.4f  | %7.4f %7.4f | %7.4f %7.4f \n"%(name, 
+        outf.write("%-32s | %14s %14s |  %6.2f  |  %7.4f  %7.4f  %7.4f  |  %7.4f  %7.4f  %7.4f  | %7.4f %7.4f | %7.4f %7.4f \n"%(name, 
             "%d(%d)"%(len(det.tar), missing_tar), 
             "%d(%d)"%(len(det.non), missing_non), 
             eer*100, 

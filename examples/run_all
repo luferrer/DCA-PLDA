@@ -2,11 +2,12 @@
 #
 # Run two different backends, with different architectures
 #
-# * plain DPLDA: PLDA form trained discriminatively
+# * D-PLDA: PLDA form trained discriminatively
 #
-# * sideinfo dependent DPLDA: same as above with the
-#   addition of a calibration stage that depends on an automatically
-#   extracted side-info vector.
+# * DCA-PLDA: duration and sideinfo dependent DPLDA: same as above
+#   with the addition of a calibration stage that depends on an
+#   automatically extracted side-info vector and the duration of the
+#   samples.
 #
 # Results from this script can be found in the following files
 #
@@ -23,10 +24,8 @@
 # might result in overfitting.
 #
 # Training is run in two stages, to allow for different training
-# parameters in each stage.  For each run, we evaluate the first and
-# the best iteration on each of the two training stages. Results from
-# iteration 0000 in stage 1 should be pretty similar to what you would
-# get with a PLDA backend using the same training data.
+# parameters in each stage.  The model from the first iteration in
+# stage 1 correspond to a standard a PLDA backend.
 #
 # Results from this script show that:
 #
@@ -36,7 +35,7 @@
 #   (voxceleb2 and sitw) is very good for all three models, with
 #   DCA-PLDA outperforming the other two by a small margin
 #
-# * When training with vox and fvcaus data, performance of PLDA
+# * When training with vox and fvcaus data, performance of PLDA on
 #   vox-like data degrades significantly. On the other hand,
 #   performance with DCA-PLDA on vox-like sets is almost as good as
 #   when training with vox only, while giving large gains on fvcaus
@@ -44,34 +43,43 @@
 #
 # Hence, DCA-PLDA allows us to use heterogeous data to train a single
 # SID system that gives excellent performance for all conditions
-# considered in training.
+# considered in training. As shown in our papers, when trained on a
+# larger variety of data, this model can also generalize to unseen
+# conditions.
 
 
-device=CPU # Or use the GPU number, if GPU is available
+# CPU or GPU number, if GPU is available
+device=0
 seed=0
+
+# Sets used to choose the best model from the second stage
+dev_sets="heldout_vox heldout_vox_4-30sec" 
+
+printf "%-30s %-15s %-15s %s\n" "Set" "Train-Data" "System" "Actual-Cllr" > tmp$$
 
 for trndata in vox vox+fvcaus; do
 
-    for archn in dplda dplda_sidep; do
+    out_dir=output/train_${trndata}
+    
+    for archn in dplda dplda_dursidep; do
 
 	conf=configs/arch/$archn.ini
-    
-	out_dir=output/train_${trndata}_dev_sitw/$archn/seed$seed
-	./run_expt -d "sitw.dev" -o $out_dir -a $conf -D $device -s $seed -t $trndata
+	./run_expt -d "$dev_sets" -o $out_dir/$archn/seed$seed -a $conf -D $device -s $seed -t $trndata
 
     done
 
-    echo ""
-    echo "################################## Training with $trndata ###########################################################"
-    echo ""
-    echo "# PLDA with global calibration"
-    cat output/train_${trndata}_dev_sitw/dplda/seed$seed/stage1/eval_ep0000/all_results
-    echo ""
-    echo "# Discriminative PLDA"
-    cat output/train_${trndata}_dev_sitw/dplda/seed$seed/stage2/eval_best/all_results
-    echo ""
-    echo "# Discriminative Condition-Aware PLDA"
-    cat output/train_${trndata}_dev_sitw/dplda_sidep/seed$seed/stage2/eval_best/all_results
-    echo ""
+    # For full results with all metrics, look at the files below:
+    plda=$out_dir/dplda/seed$seed/stage1/eval_ep0000/all_results
+    dplda=$out_dir/dplda/seed$seed/stage2/eval_best/all_results
+    dcaplda=$out_dir/dplda_dursidep/seed$seed/stage2/eval_best/all_results
+    
+    # Summarized results showing only actual Cllr and grouped by set rather than my model for ease of comparison
+    cat $plda    | gawk -v t=$trndata -v n=1.PLDA    'NR>2{gsub(/:.*/,"",$1); printf "%-30s %-15s %-15s %s\n", $1, t, n, $8}' >> tmp$$
+    cat $dplda   | gawk -v t=$trndata -v n=2.DPLDA   'NR>2{gsub(/:.*/,"",$1); printf "%-30s %-15s %-15s %s\n", $1, t, n, $8}' >> tmp$$
+    cat $dcaplda | gawk -v t=$trndata -v n=3.DCAPLDA 'NR>2{gsub(/:.*/,"",$1); printf "%-30s %-15s %-15s %s\n", $1, t, n, $8}' >> tmp$$
 done
+
+cat tmp$$ | sort | gawk '{if($1!=prev) print ""; prev=$1; print}'
+rm tmp$$
+
 
