@@ -31,7 +31,7 @@ We will appreciate any feedback about the code or the approaches. Also, please l
 
    ```https://sftp.speech.sri.com/forms/DCA-DPLDA```   
    
-   Untar the file and move (or link) the resulting data/ dir inside the example dir.
+   Untar the file and move (or link) the resulting data/ dir inside the example dir. Note that, to run the latest version of the example code you need the latest embeddings from that page. If you downloaded them before Feb 1st 2021, please download them again (they should say v2 in the file name). 
 
 4. You can then run the run_all script which runs several experiments using different configuration files and training sets. You can edit it to just try a single configuration, if you want. Please, see the top of that script for an explanation on what is run and where the output results end up. The script will take a few hours to run (on a GPU) if all configurations are run.
 
