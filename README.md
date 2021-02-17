@@ -2,11 +2,11 @@
 
 This repository implements the Discriminative Condition-Aware Backend described in the paper:
 
-*Ferrer, L. and McLaren, M., "A Speaker Verification Backend for Improved Calibration Performance across Varying Conditions", in Proc. of Odyssey 2020, Tokyo, Japan, Nov. 2020*
+*Ferrer, L. and McLaren, M., ["A Speaker Verification Backend for Improved Calibration Performance across Varying Conditions"](https://www.isca-speech.org/archive/Odyssey_2020/pdfs/5.pdf), in Proc. of Odyssey 2020, Tokyo, Japan, Nov. 2020*
 
 and in
 
-*Ferrer, L. and McLaren, M. and Brümmer N., "A Speaker Verification Backend with Robust Performance across Conditions", arXiv:2102.01760*
+*Ferrer, L. and McLaren, M. and Brümmer N., ["A Speaker Verification Backend with Robust Performance across Conditions"](https://arxiv.org/pdf/2102.01760), arXiv:2102.01760*
 
 This backend has the same functional form as the usual probabilistic discriminant analysis (PLDA) backend which is commonly used for speaker verification, including the preprocessing stages. It also integrates the calibration stage as part of the backend, where the calibration parameters depend on an estimated condition for the signal. The condition is internally represented by a very low dimensional vector. See the paper for more details on the mathematical formulation of the backend.
 
