@@ -48,7 +48,6 @@ class SpeakerDataset(Dataset):
         else:
             raise Exception("Bad format for ids in embeddings file %s (should be strings)"%emb_file)
 
-        self.str_to_idx = dict()        
         self.idx_to_str = dict()        
         self.meta = dict()
             
@@ -72,8 +71,9 @@ class SpeakerDataset(Dataset):
                 if field == 'sample_id' and len(names)!=len(self.meta_raw):
                     raise Exception("Metadata file %s has repeated sample ids"%meta_file)
 
-                self.str_to_idx[field] = dict(zip(names, np.arange(len(names))))
-                self.idx_to_str[field] = dict(zip(np.arange(len(names)),names))
+                # Index to string and string to index maps                
+                self.idx_to_str[field]        = dict(zip(np.arange(len(names)),names))
+                self.idx_to_str[field+"_inv"] = dict(zip(names, np.arange(len(names))))
                 self.meta[field] = np.array(nmap, dtype=np.int32)
             else:
                 self.meta[field] = self.meta_raw[field]
@@ -196,7 +196,6 @@ class TrialLoader(object):
             list_dict[kl] = list(set(list_dict[kl]))
             index_dict[kl] = 0
             if len(list_dict[kl]) < min_len:
-                embed()
                 raise Exception("Not enough %ss for some combination of %s (there should be at least %d %s per %s)"%
                     (list_field, str(key_fields), min_len, list_field, str(key_fields)))
             self.rng.shuffle(list_dict[kl])
@@ -247,7 +246,7 @@ class TrialLoader(object):
             for dom in self.domains:
                 print("  dom %s: %d resets, %d speakers"%(self.metamaps['domain_id'][dom[0]], num_rewinds[dom], len(self.spkrs_for_dom[dom])))
         else:
-            print("Dumped %d batches with %d resets, %d speakers."%(self.num_batches, len(self.spkrs_for_dom[dom]), num_rewinds[self.domains[0]]))
+            print("Dumped %d batches with %d resets, %d speakers."%(self.num_batches, num_rewinds[self.domains[0]], len(self.spkrs_for_dom[dom])))
 
 
     def _np_to_torch(self, x):

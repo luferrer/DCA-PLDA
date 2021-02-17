@@ -17,6 +17,7 @@ parser.add_argument('--keylist',  help='List of keys for scoring. If not provide
 parser.add_argument('--ptar',     help='Prior for Cllr and DCF computation if keylist is provided.', default=0.01, type=float)
 parser.add_argument('--set',      help='Name for the set, to be used in the results file.', default=None)
 parser.add_argument('--raw',      help='Output the raw scores, before the calibration stages (used for analysis).', default=False, action='store_true')
+parser.add_argument('--fmt',      help='Format of output scores: h5 or ascii.', default='h5')
 parser.add_argument('model',      help='Path to the model to be used for evaluation.')
 parser.add_argument('embeddings', help='Path to the npz file with development embeddings.')
 parser.add_argument('enroll_map', help='Map from enrollment ids (first column) to the ids used in the embeddings file (second column).\
@@ -37,18 +38,22 @@ else:
     torch.set_default_tensor_type(torch.FloatTensor)
     device = torch.device("cpu")
 
-###### Load the data
-dataset = SpeakerDataset(opt.embeddings, opt.durs, meta_is_dur_only=True, device=device)
-emap = IdMap.load(opt.enroll_map, dataset.get_ids())
-tmap = IdMap.load(opt.test_map, dataset.get_ids())
-
 ###### Load the model
 model = load_model(opt.model, device)
 print("Loaded model from %s"%opt.model)
+
+###### Load the data
+dataset = SpeakerDataset(opt.embeddings, opt.durs, meta_is_dur_only=True, device=device)
+if model.enrollment_classes is not None:
+    assert opt.enroll_map == 'NONE'
+    emap = IdMap.load(opt.enroll_map, model.enrollment_classes)
+else:
+    emap = IdMap.load(opt.enroll_map, dataset.get_ids())
+tmap = IdMap.load(opt.test_map, dataset.get_ids())
     
 ###### Generate the scores
 scores = evaluate(model, dataset, emap, tmap, min_dur=opt.min_dur, raw=opt.raw)
-scores.save("%s/scores.h5"%opt.out_dir)
+scores.save("%s/scores.%s"%(opt.out_dir, opt.fmt), fmt=opt.fmt)
 
 if opt.keylist is not None:
     compute_performance(scores, opt.keylist, "%s/results"%opt.out_dir, ptar=opt.ptar, setname=opt.set)

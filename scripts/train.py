@@ -66,20 +66,27 @@ def test_model(model, data_dict, model_name, ptar, loss_type, print_min_loss=Fal
     av_loss /= len(data_dict)
     return av_loss
 
-def load_data_dict(table, device):
+def load_data_dict(table, device, fixed_enrollment_ids=None):
     data_dict = dict()
     for line in open(table).readlines():
         f = line.strip().split()
         name, emb, key, emapf, tmapf = f[0:5]
         dur = f[5] if len(f) > 3 else None
         dataset = SpeakerDataset(emb, dur, meta_is_dur_only=True, device=device)
-        emap = IdMap.load(emapf, dataset.get_ids())
+        if fixed_enrollment_ids is not None:
+            # Enrollment embeddings are part of the model, not provided in the data
+            assert emapf == 'NONE'
+            emap = IdMap.load(emapf, fixed_enrollment_ids)
+        else:
+            emap = IdMap.load(emapf, dataset.get_ids())
+
         tmap = IdMap.load(tmapf, dataset.get_ids())
         # Load key file in the order in which the model ids were loaded in emap 
         # and tmap. This ensures that the scores and keys will be aligned.
         mask = np_to_torch(Key.load(key, emap.model_ids, tmap.model_ids).mask, device)
         data_dict[name] = {'dataset': dataset, 'mask': mask, 'emap': emap, 'tmap': tmap}
     return data_dict
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--debug',        help='Enable debug mode.', action='store_true')
@@ -123,7 +130,7 @@ in_size = trn_dataset[0]['emb'].shape[0]
 model = DCA_PLDA_Backend(in_size, config.architecture).to(device)
 print_graph(model, trn_dataset, device, opt.out_dir)
 
-dev_data_dict = load_data_dict(opt.dev_table, device)
+dev_data_dict = load_data_dict(opt.dev_table, device, model.enrollment_classes)
 
 ###### Train
 mkdirp(opt.out_dir)

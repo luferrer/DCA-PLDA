@@ -49,7 +49,7 @@
 
 
 # CPU or GPU number, if GPU is available
-device=0
+device=3
 seed=0
 
 # Sets used to choose the best model from the second stage

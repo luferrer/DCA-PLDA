@@ -21,6 +21,7 @@ def train(model, loader, optimizer, epoch, config, debug_dir=None):
         batches_file = open("%s/batches_epoch_%04d"%(debug_dir, epoch), "w")
 
     print("Starting epoch %d"%epoch)
+
     for batch_idx, (data, metadata) in enumerate(loader):
         if debug_dir:
             print_batch(batches_file, metadata, loader.metamaps, batch_idx)
@@ -38,7 +39,9 @@ def train(model, loader, optimizer, epoch, config, debug_dir=None):
         # I want to do the clipping on the full gradient rather than only on the 
         # part corresponding to the loss since this seems to work better.
         # The loss_scale is there for backward compatibility with my old TF code.
-        loss, llrs, labels = modules.compute_loss(output, metadata=metadata, ptar=config.ptar, loss_type=config.loss, return_info=True) 
+        loss, llrs, labels = modules.compute_loss(output, metadata=metadata, ptar=config.ptar, loss_type=config.loss, 
+            return_info=True, enrollment_ids=model.enrollment_classes, ids_to_idxs=loader.metamaps['speaker_id_inv'])
+
         loss_scale = config.batch_size * 0.056 
         regt, regl = 0.0, 0.0
 
@@ -95,7 +98,7 @@ def evaluate(model, dataset, emap, tmap, min_dur=0, raw=False):
         
         # We assume that emap and tmap were created using the ids in the dataset, but
         # we double check just in case.
-        if np.any(ids!=tmap.sample_ids) or np.any(ids!=emap.sample_ids):
+        if np.any(ids!=tmap.sample_ids) or (np.any(ids!=emap.sample_ids) and model.enrollment is None):
             raise Exception("The dataset is not sorted the same way as the columns in emap or tmap. Make sure emap and tmap are created using the sample_ids in the dataset object you use in evaluation.")
 
         tidx = tmap.mappings[1]['map'][0]
@@ -109,8 +112,13 @@ def evaluate(model, dataset, emap, tmap, min_dur=0, raw=False):
             scoresk = torch.zeros(len(eidsk), len(tids))  
             for i in np.arange(k):
                 eidx = emapk[i]
-                scoreski = model.score(data[eidx], data[tidx], durs[eidx], durs[tidx], raw=raw)
-                scoreski[durs[eidx]<min_dur, :] = 0
+                if model.enrollment is None:
+                    scoreski = model.score(data[tidx], data[eidx], durs[tidx], durs[eidx], raw=raw)
+                    scoreski[durs[eidx]<min_dur, :] = 0
+                else:
+                    # Enrollment embeddings are part of the model
+                    scoreski = model.score(data[tidx], None, durs[tidx], None, raw=raw)[eidx]                    
+
                 scoreski[:, durs[tidx]<min_dur] = 0
                 scoresk += scoreski
             scoresk /= k
@@ -367,6 +375,23 @@ def find_checkpoint(dir, which="last", n=1):
         return checkpoints[0], epochs[0], devlosses[0]
     else:
         return checkpoints, epochs, devlosses
+
+def onehot_for_class_ids(sample_class_idxs, target_ids, map_ids_to_idxs):
+    """ One-hot vector but with the columns sorted based on the list of classes in
+    target_ids. Since sample_classidxs contains indices, the map is used to go from
+    indices to class ids."""
+    onehot = np.zeros((sample_class_idxs.shape[0], len(target_ids)))
+    for i, tid in enumerate(target_ids):
+        onehot[:,i] = np.array(sample_class_idxs==map_ids_to_idxs[tid], dtype=int)
+    
+    if type(sample_class_idxs) == torch.Tensor:
+        # convert the np array to torch
+        # I should eventually figure out if I can do the stuff above in a way that 
+        # works for both tensors and np arrays so that I don't need to do this
+        # conversion.
+        onehot = np_to_torch(onehot, sample_class_idxs.device)
+
+    return onehot
 
 
 class AttrDict(dict):

@@ -11,7 +11,8 @@ import data as ddata
 import calibration
 from scipy import linalg
 
-def compute_loss(llrs, metadata=None, ptar=0.01, mask=None, loss_type='cross_entropy', return_info=False):
+def compute_loss(llrs, metadata=None, ptar=0.01, mask=None, loss_type='cross_entropy', return_info=False, 
+    enrollment_ids=None, ids_to_idxs=None):
 
     if metadata is None:
         assert mask is not None
@@ -21,7 +22,16 @@ def compute_loss(llrs, metadata=None, ptar=0.01, mask=None, loss_type='cross_ent
         same_spk = mask == 1
     else:
         assert metadata is not None
-        same_spk, valid = utils.create_scoring_masks(metadata)
+        if enrollment_ids is None:
+            # The llrs are assumed to correspond to all vs all trials
+            same_spk, valid = utils.create_scoring_masks(metadata)
+        else:
+            # The llrs are assumed to correspond to all samples. The speaker ids in this case are
+            # indices that have to be mapped to enrollment indexes. 
+            spk_ids = metadata['speaker_id'].type(torch.int)
+            same_spk = utils.onehot_for_class_ids(spk_ids, enrollment_ids, ids_to_idxs).T
+            # All samples are valid. 
+            valid = torch.ones_like(llrs).type(torch.bool)
 
     # Select the valid llrs and shift them to convert them to logits
     llrs   = llrs[valid]
@@ -64,6 +74,16 @@ class DCA_PLDA_Backend(nn.Module):
 
         self.plda_stage = Quadratic(lda_dim)
 
+        if self.config.get('fixed_enrollment_ids'):
+            # In this case, the enrollment vectors are pre-defined and another parameter of the model
+            # Use the Affine class for this. Only the W of and the init methods of that class are used, not the forward.
+            # Read the list of enrollment classes from a text file provided in the config.
+            self.enrollment_classes = [l.strip().split()[0] for l in open(self.config.get('fixed_enrollment_ids')).readlines()]
+            self.enrollment = Affine(lda_dim, len(self.enrollment_classes), bias=False)
+        else:
+            self.enrollment_classes = None
+            self.enrollment = None
+
         if config.get('sideinfo_parameters'):
             idim = config.sideinfo_parameters.get('internal_dim', 200)
             edim = config.sideinfo_parameters.get('external_dim', 5)
@@ -98,43 +118,47 @@ class DCA_PLDA_Backend(nn.Module):
 
     def forward(self, x, durations=None):
         # The forward method assumes the same enroll and test data. This is used in training.
-        return self.score(x, dure=durations)
+        return self.score(x, durt=durations)
 
-
-    def score(self, xe, xt=None, dure=None, durt=None, si_only=False, raw=False):
+    def score(self, xt, xe=None, durt=None, dure=None, si_only=False, raw=False):
         # Same as the forward method but it allows for assymetric scoring where the rows and columns
         # of the resulting score file corresponds to two different sets of data
 
-        hast = xt is not None
+        hase = xe is not None
 
-        x2e = self.lda_stage(xe)
-        x2t = self.lda_stage(xt) if hast else None
+        x2e = self.lda_stage(xe) if hase else None
+        x2t = self.lda_stage(xt) 
         
         if hasattr(self,'si_stage1'):
             si_inpute = xe if self.si_input == 'main_input' else x2e
             si_inputt = xt if self.si_input == 'main_input' else x2t
              
-            s2e = self.si_stage1(si_inpute)
-            s2t = self.si_stage1(si_inputt) if hast else None
+            s2e = self.si_stage1(si_inpute) if hase else None
+            s2t = self.si_stage1(si_inputt) 
 
-            sie = self.si_stage2(s2e)
-            sit = self.si_stage2(s2t) if hast else None
+            sie = self.si_stage2(s2e) if hase else None
+            sit = self.si_stage2(s2t) 
 
         else:
             sie = sit = None
 
         if si_only:
-            assert xt is None and sie is not None
-            return sie
+            assert xe is None and sit is not None
+            return sit
         else:
 
             if self.config.get('si_dependent_shift_parameters'):
                 # Use the si to find a shift vector for each sample 
-                x2e = x2e - self.shift_selector(sie)
-                x2t = x2t - self.shift_selector(sit) if hast else None
+                x2e = x2e - self.shift_selector(sie) if hase else None
+                x2t = x2t - self.shift_selector(sit) 
 
-            scrs = self.plda_stage.score(x2e, x2t)
-            llrs = self.cal_stage.calibrate(scrs, dure, sie, durt, sit)            
+            if self.enrollment is not None:
+                assert xe is None
+                scrs = self.plda_stage.score(x2t, self.enrollment.W.T)
+            else:
+                scrs = self.plda_stage.score(x2t, x2e)
+
+            llrs = self.cal_stage.calibrate(scrs, durt, sit, dure, sie)            
             return llrs if raw is False else scrs
 
 
@@ -148,7 +172,7 @@ class DCA_PLDA_Backend(nn.Module):
         # I chose to keep these two methods separate to leave the forward small and easy to read.
         with torch.no_grad():
 
-            x, meta, _ = dataset.get_data_and_meta(subset)
+            x, meta, idx_to_str = dataset.get_data_and_meta(subset)
             speaker_ids = meta['speaker_id']
             domain_ids  = meta['domain_id']
             x_torch = utils.np_to_torch(x, device)
@@ -200,8 +224,14 @@ class DCA_PLDA_Backend(nn.Module):
 
             if init_params.get("random"):
                 self.plda_stage.init_random(init_params.get('stdev',0.1))
+                if self.enrollment is not None:
+                    self.enrollment.init_random(init_params.get('stdev',0.1))
             else:    
                 self.plda_stage.init_with_plda(x2, speaker_ids, init_params, domain_ids=domain_ids)
+                if self.enrollment is not None:
+                    # idx_to_str['speaker_id_inv'] contains a mapping from string to indices corresponding to the speaker_ids array
+                    speaker_ids_onehot = utils.onehot_for_class_ids(speaker_ids, self.enrollment_classes, idx_to_str['speaker_id_inv'])
+                    self.enrollment.init_with_weighted_means(x2, speaker_ids_onehot)
 
             # Since the training data is usually large, we cannot create all possible trials for x3.
             # So, to create a bunch of trials, we just create a trial loader with a large batch size.
@@ -328,26 +358,26 @@ class CA_Calibrator(nn.Module):
 
         return durs
 
-    def calibrate(self, scores, durations_enroll=None, side_info_enroll=None, durations_test=None, side_info_test=None):
+    def calibrate(self, scores, durations_test=None, side_info_test=None, durations_enroll=None, side_info_enroll=None):
 
         if self.is_sidep:
             # Sideinfo-dep calibration, optionally with the duration appended
             if self.config.get('concat_durfeats_with_sideinfo'):
-                durs_enroll = self._process_durs(durations_enroll)
-                durs_test   = self._process_durs(durations_test) if durations_test is not None else None
-                side_info_enroll = torch.cat([durs_enroll, side_info_enroll], 1)
-                side_info_test   = torch.cat([durs_test,   side_info_test],   1) if side_info_test is not None else None
-            alpha_si = self.sidep_alpha.score(side_info_enroll, side_info_test)
-            beta_si  = self.sidep_beta.score(side_info_enroll, side_info_test)
+                durs_enroll = self._process_durs(durations_enroll) if durations_enroll is not None else None
+                durs_test   = self._process_durs(durations_test) 
+                side_info_enroll = torch.cat([durs_enroll, side_info_enroll], 1) if side_info_enroll is not None else None
+                side_info_test   = torch.cat([durs_test,   side_info_test],   1) 
+            alpha_si = self.sidep_alpha.score(side_info_test, side_info_enroll)
+            beta_si  = self.sidep_beta.score(side_info_test, side_info_enroll)
             if self.si_cal_first:
                 scores = alpha_si*scores + beta_si
 
         if self.is_durdep:
             # Dur-dep calibration 
-            durs_enroll = self._process_durs(durations_enroll)
-            durs_test   = self._process_durs(durations_test) if durations_test is not None else None
-            alpha = self.durdep_alpha.score(durs_enroll, durs_test)
-            beta  = self.durdep_beta.score(durs_enroll, durs_test)
+            durs_enroll = self._process_durs(durations_enroll) if durations_enroll is not None else None
+            durs_test   = self._process_durs(durations_test) 
+            alpha = self.durdep_alpha.score(durs_test, durs_enroll)
+            beta  = self.durdep_beta.score(durs_test, durs_enroll)
 
         elif not self.is_sidep:
             # Global calibration
@@ -425,30 +455,30 @@ class Quadratic(nn.Module):
         # The forward method assumes the same enroll and test data. This is used in training.
         return self.score(x)
 
-    def score(self, xe, xt=None):
+    def score(self, xt, xe=None):
         # PLDA-like computation. The output i, j is given by
         # 2 * xi^T L xj + xi^T G xi + xj^T G xj + xi^T C + xj^T C + k
-        if xt is None:
+        if xe is None:
             symmetric = True
-            xt = xe
+            xe = xt
         else:
             symmetric = False
 
         Lterm  = torch.matmul(torch.matmul(xe, 0.5*(self.L+self.L.T)), xt.T)
         
         if self.C is not None:
-            Cterme = torch.matmul(xe, self.C) 
-            Ctermt = torch.matmul(xt, self.C) if not symmetric else Cterme
+            Ctermt = torch.matmul(xt, self.C) 
+            Cterme = torch.matmul(xe, self.C) if not symmetric else Ctermt
         else:   
-            Cterme = torch.zeros(xe.shape[0],1)
-            Ctermt = torch.zeros(xt.shape[0],1) if not symmetric else Cterme
+            Ctermt = torch.zeros(xt.shape[0],1) 
+            Cterme = torch.zeros(xe.shape[0],1) if not symmetric else Ctermt
 
         if self.G is not None:
-            Gterme = torch.sum(xe * torch.matmul(xe, 0.5*(self.G+self.G.T)) , 1, keepdim=True)  
-            Gtermt = torch.sum(xt * torch.matmul(xt, 0.5*(self.G+self.G.T)) , 1, keepdim=True) if not symmetric else Gterme
+            Gtermt = torch.sum(xt * torch.matmul(xt, 0.5*(self.G+self.G.T)) , 1, keepdim=True) 
+            Gterme = torch.sum(xe * torch.matmul(xe, 0.5*(self.G+self.G.T)) , 1, keepdim=True) if not symmetric else Gtermt 
         else:
-            Gterme = torch.zeros(xe.shape[0],1)
-            Gtermt = torch.zeros(xt.shape[0],1) if not symmetric else Gterme
+            Gtermt = torch.zeros(xt.shape[0],1)
+            Gterme = torch.zeros(xe.shape[0],1) if not symmetric else Gterme
         
         output = 2 * Lterm + Gterme + Gtermt.T + Cterme + Ctermt.T + self.k
 
@@ -604,9 +634,9 @@ class Affine(nn.Module):
     def init_with_weighted_means(self, data, weights):
 
         Wl = list()
-        for i in np.arange(self.W.shape[0]):
-            Wl.append(np.dot(data.T, weights[:,i])/np.sum(weights[:,i]))
-        utils.replace_state_dict(self, {'W': np.c_[Wl]})
+        for w in weights.T:
+            Wl.append(np.dot(data.T, w)/np.sum(w))
+        utils.replace_state_dict(self, {'W': np.c_[Wl].T})
 
 
 class SimpleNN(nn.Module):

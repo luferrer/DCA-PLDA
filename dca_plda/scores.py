@@ -31,8 +31,10 @@ class Key(object):
 
     @classmethod
     def load(self, filename, enrollids=None, testids=None):
-        """ Build Key from a text file with the following format trainID testID tgt/imp,
-        or in h5 format.
+        """ Build Key from a text file with the following format 
+        * trainID testID tgt/imp for SID
+        * testID languageID for LID
+        or in h5 format where the enrollids are the languageids in the case of LID.
         """
 
         if filename.endswith(".h5"):
@@ -47,11 +49,15 @@ class Key(object):
         else:
             func = gzip.open if os.path.splitext(filename)[1] == ".gz" else open
             with func(filename) as f:
-                L = [line.strip().split(' ')[0:3] for line in f]
-            try:
-                enrollids_in_key, testids_in_key, _ = map(lambda t: list(set(t)), zip(*L))
-            except ValueError as e:
-                raise Exception("Need 3 columns for a key (file %s)."%filename)
+                lines = [line.strip().split(' ')[0:3] for line in f]
+
+            if len(lines[0]) == 3:
+                enrollids_in_key, testids_in_key, _ = map(lambda t: list(set(t)), zip(*lines))
+            elif len(lines[0]) == 2:
+                testids_in_key, _ = map(lambda t: list(set(t)), zip(*lines))
+                enrollids_in_key = enrollids
+            else:
+                raise Exception("Need 3 columns for a SID key or 2 for LID key (file %s)."%filename)
             mask_in_key = None
 
         print("Loaded key file %s"%filename)
@@ -84,12 +90,20 @@ class Key(object):
             idxtestids = dict([(x,i) for i,x in enumerate(testids)])
             nbT, nbt = len(enrollids), len(testids)
 
-            # default mask to have all trials not included ('0')
-            mask = np.zeros((nbT, nbt),dtype=np.int8)
-            for e, t, vs in L:
-                if e in idxenrollids and t in idxtestids:
-                    v = 1 if vs == "tgt" else -1
-                    mask[idxenrollids[e], idxtestids[t]] = v
+            if len(lines[0]) == 3:
+                # default mask to have all trials not included ('0')
+                mask = np.zeros((nbT, nbt),dtype=np.int8)
+                for e, t, vs in lines:
+                    if e in idxenrollids and t in idxtestids:
+                        v = 1 if vs == "tgt" else -1
+                        mask[idxenrollids[e], idxtestids[t]] = v
+            else:
+                # All trials are valid in this case. The mask is -1 except for
+                # the language corresponding to the sample.
+                mask = -np.ones((nbT, nbt),dtype=np.int8)
+                for t, e in lines:
+                    if e in idxenrollids and t in idxtestids:
+                        mask[idxenrollids[e], idxtestids[t]] = 1
 
         return Key(enrollids, testids, mask)
 
@@ -139,12 +153,18 @@ class Scores(object):
         
         return Scores(key.enroll_ids, key.test_ids, new_score_mat, missing)
 
-    def save(self, outfile):
-        with h5py.File(outfile,'w') as f:
-            f.create_dataset('test_ids',   data=np.string_(self.test_ids))
-            f.create_dataset('enroll_ids', data=np.string_(self.enroll_ids))
-            f.create_dataset('scores',     data=self.score_mat)
-    
+    def save(self, outfile, fmt = 'h5'):
+        if fmt == 'h5':
+            with h5py.File(outfile,'w') as f:
+                f.create_dataset('test_ids',   data=np.string_(self.test_ids))
+                f.create_dataset('enroll_ids', data=np.string_(self.enroll_ids))
+                f.create_dataset('scores',     data=self.score_mat)
+        else:
+            with open(outfile, 'w') as f:
+                for ti, t in enumerate(self.test_ids):
+                    for ei, e in enumerate(self.enroll_ids):
+                        print("%s %s %f"%(e,t, self.score_mat[ei, ti]), file=f)
+
 
     @classmethod
     def load(self, filename):
@@ -187,7 +207,15 @@ class IdMap(object):
         idmap = IdMap(sample_ids)
 
         missing = dict()
-        for mid, sid in [l.strip().split()[0:2] for l in open(mapfile).readlines()]:
+
+        if mapfile != "NONE":
+            lines = [l.strip().split()[0:2] for l in open(mapfile).readlines()]
+        else:
+            # If no mapfile is provided, asume that the mapping includes all samples
+            # and that model ids coincide with sample ids.
+            lines = [(s,s) for s in sample_ids]
+
+        for mid, sid in lines:
             if sid in idmap.sample_id_to_idx:
                 if mid not in idmap.model_dict:
                     idmap.model_dict[mid] = [sid]
