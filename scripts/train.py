@@ -96,6 +96,7 @@ parser.add_argument('--configs',      help='List of configuration files to load.
 parser.add_argument('--mods',         help='List of values to overwride config parameters. Example: training.num_epochs=20,architecture.lda_dim=200', default=None)
 parser.add_argument('--init_subset',  help='Subset of the train files to be used for initialization. For default, the files in trn_metafile are used.', default=None)
 parser.add_argument('--restart',      help='Restart training from last available model.', action='store_true')
+parser.add_argument('--detectors',    help='List of classes to use as a fixed set of enrollment ids (used, eg, for language detection).', default=None)
 parser.add_argument('--print_min_loss', help='Print the min loss for each dev set at each epoch.', action='store_true')
 parser.add_argument('trn_embeddings', help='Path to the npz file with training embeddings.')
 parser.add_argument('trn_metafile',   help='Path to the metadata for the training samples (all samples listed in this file should be present in the embeddings file).')
@@ -127,6 +128,7 @@ else:
 trn_metafiles = opt.trn_metafile.split(",")
 trn_dataset = SpeakerDataset(opt.trn_embeddings, trn_metafiles[0])
 in_size = trn_dataset[0]['emb'].shape[0]
+config.architecture['fixed_enrollment_ids'] = opt.detectors
 model = DCA_PLDA_Backend(in_size, config.architecture).to(device)
 print_graph(model, trn_dataset, device, opt.out_dir)
 

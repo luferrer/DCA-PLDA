@@ -153,8 +153,12 @@ class DCA_PLDA_Backend(nn.Module):
                 x2t = x2t - self.shift_selector(sit) 
 
             if self.enrollment is not None:
-                assert xe is None
+                assert xe is None and dure is None and sie is None
                 scrs = self.plda_stage.score(x2t, self.enrollment.W.T)
+                # In this case, there is no dur or si for the enrollment side. 
+                # Set them to a vector of constants 
+                dure = 2*torch.ones(scrs.shape[0]).to(scrs.device) if durt is not None else None
+                sie = torch.ones([scrs.shape[0], sit.shape[1]]).to(scrs.device) if sit is not None else None
             else:
                 scrs = self.plda_stage.score(x2t, x2e)
 
@@ -278,25 +282,27 @@ class CA_Calibrator(nn.Module):
             self.dur_rep = self.config.get('duration_representation', 'log') 
             self.dur_thresholds = self.config.get('duration_thresholds')
             self.si_cal_first = self.config.get('si_cal_first', True) 
-            numdurf = self._process_durs(torch.ones(10)).shape[1]
+            numdurf = self._process_durs(torch.ones(10), init=True).shape[1]
 
         if self.config and self.config.get('sideinfo_dependent'):
             self.is_sidep = True
             use_G = config.get("use_G_for_si", True) 
+            use_L = config.get("use_L_for_si", True) 
             use_C = config.get("use_C_for_si", True)
             self.si_dim = si_dim
             if self.config.get('concat_durfeats_with_sideinfo'):
                 self.si_dim += numdurf
-            self.sidep_alpha = Quadratic(self.si_dim, use_G=use_G, use_C=use_C)
-            self.sidep_beta  = Quadratic(self.si_dim, use_G=use_G, use_C=use_C)
+            self.sidep_alpha = Quadratic(self.si_dim, use_G=use_G, use_C=use_C, use_L=use_L)
+            self.sidep_beta  = Quadratic(self.si_dim, use_G=use_G, use_C=use_C, use_L=use_L)
 
         if self.config and self.config.get('duration_dependent'):
             self.is_durdep = True
             # Fake input to _process_durs just to get the dimension of the processed duration vector
             use_G = config.get("use_G_for_dur", True) 
+            use_L = config.get("use_L_for_dur", True) 
             use_C = config.get("use_C_for_dur", True) 
-            self.durdep_alpha = Quadratic(numdurf, use_G=use_G, use_C=use_C)
-            self.durdep_beta  = Quadratic(numdurf, use_G=use_G, use_C=use_C)
+            self.durdep_alpha = Quadratic(numdurf, use_G=use_G, use_C=use_C, use_L=use_L)
+            self.durdep_beta  = Quadratic(numdurf, use_G=use_G, use_C=use_C, use_L=use_L)
         
         if not self.is_sidep and not self.is_durdep:
             # Global calibration
@@ -316,26 +322,45 @@ class CA_Calibrator(nn.Module):
             result += (tensor > boundary).int()
         return result
 
-    def _process_durs(self, durations):
+    def _process_durs(self, durations, init=False):
         
         if self.dur_rep == 'log':
             durs = torch.log(durations.unsqueeze(1))
+
+        elif self.dur_rep == 'logpa':
+            # Logarithm with a shift initiliazed with 0
+            if init: 
+                self.logdur_shift = Parameter(torch.tensor(0.0))
+            durs = torch.log(durations.unsqueeze(1)+self.logdur_shift)
+
         elif self.dur_rep == 'log2':
             durs = torch.log(durations.unsqueeze(1))
             durs = torch.cat([durs, durs*durs], 1)
+
         elif self.dur_rep == 'idlog':
             durs = durations.unsqueeze(1)
             durs = torch.cat([durs/100, torch.log(durs)], 1)
-        elif self.dur_rep == 'siglog':
+
+        elif self.dur_rep == 'siglog' or self.dur_rep == 'siglogp':
             durs = torch.log(durations.unsqueeze(1))
             # Take the log durs and multiplied them by a sigmoid centered a some value
             # and then again with a rotated sigmoid
-            scale  = self.config.get("duration_sigmoid_scale")
-            centers = np.log(self.dur_thresholds)
+            if init:
+                scale   = self.config.get("duration_sigmoid_scale")
+                centers = np.log(self.dur_thresholds)
+                if self.dur_rep == 'siglogp':
+                    # Scale and centers are learnable parameters, initialized
+                    # with the provided value
+                    self.siglogdur_scale   = Parameter(torch.tensor(scale))
+                    self.siglogdur_centers = Parameter(torch.tensor(centers))
+                else:
+                    self.siglogdur_scale   = scale
+                    self.siglogdur_centers = centers
+
             fs = []
             prev_sig = 0
-            for c in centers:
-                sigf = torch.sigmoid(-scale*(durs-c)) 
+            for c in self.siglogdur_centers:
+                sigf = torch.sigmoid(-self.siglogdur_scale*(durs-c)) 
                 sig = sigf - prev_sig
                 fs.append(durs*sig)
                 prev_sig = sigf
@@ -346,6 +371,7 @@ class CA_Calibrator(nn.Module):
             #    sig1 = torch.sigmoid(scale*(durs-center))
             #sig2 = 1.0-sig1
             #durs = torch.cat([durs*sig1, durs*sig2], 1)
+
         else:
             durs_disc = self._bucketize(durations, self.dur_thresholds)
             durs_onehot = nn.functional.one_hot(durs_disc, num_classes=len(self.dur_thresholds)+1).type(torch.get_default_dtype())
@@ -444,9 +470,9 @@ class CA_Calibrator(nn.Module):
 class Quadratic(nn.Module):
     """ Note that, while I am calling this class Quadratic, it is actually a
     second order polynomial on the inputs rather than just quadratic"""
-    def __init__(self, in_dim, use_G=True, use_C=True):
+    def __init__(self, in_dim, use_G=True, use_C=True, use_L=True):
         super().__init__()
-        self.L = Parameter(torch.zeros(in_dim, in_dim))
+        self.L = Parameter(torch.zeros(in_dim, in_dim)) if use_L else None
         self.G = Parameter(torch.zeros(in_dim, in_dim)) if use_G else None
         self.C = Parameter(torch.zeros(in_dim, 1)) if use_C else None
         self.k = Parameter(torch.tensor(0.0))
@@ -464,7 +490,10 @@ class Quadratic(nn.Module):
         else:
             symmetric = False
 
-        Lterm  = torch.matmul(torch.matmul(xe, 0.5*(self.L+self.L.T)), xt.T)
+        if self.L is not None:
+            Lterm = torch.matmul(torch.matmul(xe, 0.5*(self.L+self.L.T)), xt.T)
+        else:   
+            Lterm = torch.zeros(xe.shape[0],xt.shape[0]) 
         
         if self.C is not None:
             Ctermt = torch.matmul(xt, self.C) 

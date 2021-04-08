@@ -49,13 +49,13 @@
 
 
 # CPU or GPU number, if GPU is available
-device=3
+device=1
 seed=0
 
 # Sets used to choose the best model from the second stage
 dev_sets="heldout_vox heldout_vox_4-30sec" 
 
-printf "%-30s %-15s %-15s %s\n" "Set" "Train-Data" "System" "Actual-Cllr" > tmp$$
+printf "%-30s %-15s %-15s %-15s %-15s\n" "Set" "Train-Data" "System" "Min-Cllr" "Actual-Cllr" > tmp$$
 
 for trndata in vox vox+fvcaus; do
 
@@ -74,9 +74,9 @@ for trndata in vox vox+fvcaus; do
     dcaplda=$out_dir/dplda_dursidep/seed$seed/stage2/eval_best/all_results
     
     # Summarized results showing only actual Cllr and grouped by set rather than my model for ease of comparison
-    cat $plda    | gawk -v t=$trndata -v n=1.PLDA    'NR>2{gsub(/:.*/,"",$1); printf "%-30s %-15s %-15s %s\n", $1, t, n, $8}' >> tmp$$
-    cat $dplda   | gawk -v t=$trndata -v n=2.DPLDA   'NR>2{gsub(/:.*/,"",$1); printf "%-30s %-15s %-15s %s\n", $1, t, n, $8}' >> tmp$$
-    cat $dcaplda | gawk -v t=$trndata -v n=3.DCAPLDA 'NR>2{gsub(/:.*/,"",$1); printf "%-30s %-15s %-15s %s\n", $1, t, n, $8}' >> tmp$$
+    cat $plda    | gawk -v t=$trndata -v n=1.PLDA    'NR>2{gsub(/:.*/,"",$1); printf "%-30s %-15s %-15s %-15s %-15s\n", $1, t, n, $9, $8}' >> tmp$$
+    cat $dplda   | gawk -v t=$trndata -v n=2.DPLDA   'NR>2{gsub(/:.*/,"",$1); printf "%-30s %-15s %-15s %-15s %-15s\n", $1, t, n, $9, $8}' >> tmp$$
+    cat $dcaplda | gawk -v t=$trndata -v n=3.DCAPLDA 'NR>2{gsub(/:.*/,"",$1); printf "%-30s %-15s %-15s %-15s %-15s\n", $1, t, n, $9, $8}' >> tmp$$
 done
 
 cat tmp$$ | sort | gawk '{if($1!=prev) print ""; prev=$1; print}'

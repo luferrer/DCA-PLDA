@@ -381,15 +381,17 @@ def onehot_for_class_ids(sample_class_idxs, target_ids, map_ids_to_idxs):
     target_ids. Since sample_classidxs contains indices, the map is used to go from
     indices to class ids."""
     onehot = np.zeros((sample_class_idxs.shape[0], len(target_ids)))
-    for i, tid in enumerate(target_ids):
-        onehot[:,i] = np.array(sample_class_idxs==map_ids_to_idxs[tid], dtype=int)
-    
+
     if type(sample_class_idxs) == torch.Tensor:
-        # convert the np array to torch
-        # I should eventually figure out if I can do the stuff above in a way that 
-        # works for both tensors and np arrays so that I don't need to do this
-        # conversion.
+        # I should eventually figure out if I can do this in a way that
+        # works for both tensors and np arrays so that I don't need to move
+        # back and forth from torch to numpy
+        for i, tid in enumerate(target_ids):
+            onehot[:,i] = np.array(sample_class_idxs.detach().cpu().numpy()==map_ids_to_idxs[tid], dtype=int)
         onehot = np_to_torch(onehot, sample_class_idxs.device)
+    else:
+        for i, tid in enumerate(target_ids):
+            onehot[:,i] = np.array(sample_class_idxs==map_ids_to_idxs[tid], dtype=int)
 
     return onehot
 
