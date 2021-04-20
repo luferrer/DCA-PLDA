@@ -168,8 +168,19 @@ class TrialLoader(object):
         self.samples_for_sess_spk_dom, self.samplei = self._init_index_and_list(['session_id','speaker_id',dom_col], 'sample_id')
 
         self.domains = list(self.spki.keys())
-        self.num_spkrs_per_batch = int(batch_size/num_samples_per_spk)
-        self.num_spkrs_per_dom = int(np.ceil(self.num_spkrs_per_batch/len(self.domains)))
+        
+        self.num_spkrs_per_dom = dict()
+        for dom in self.domains:
+            if balance_by_domain == 'num_classes_per_dom_prop_to_its_total_num_classes':
+                # In this case, each domain will have a number of samples that is proporcional to
+                # the number of classes that domain has
+                self.num_spkrs_per_dom[dom] = len(self.spkrs_for_dom[dom])
+            elif balance_by_domain is True or balance_by_domain == 'same_num_classes_per_dom':
+                # In this case, each domain has the same number of speakers
+                self.num_spkrs_per_batch    = int(batch_size/num_samples_per_spk)
+                self.num_spkrs_per_dom[dom] = int(np.ceil(self.num_spkrs_per_batch/len(self.domains)))
+            elif balance_by_domain is not False or balance_by_domain is not None:
+                raise Exception("Option for balance_by_domain (%s) not implemented"%balance_by_domain)
 
         self.sample_to_idx = dict(np.c_[self.metadata['sample_id'], np.arange(len(self.metadata['sample_id']))])
 
@@ -220,8 +231,7 @@ class TrialLoader(object):
             sel_idxs = []
 
             for dom in self.domains:
-
-                for numsp in np.arange(self.num_spkrs_per_dom):
+                for numsp in np.arange(self.num_spkrs_per_dom[dom]):
 
                     # Select a speaker from this domain
                     spk_dom, r = self._find_value(self.spki, self.spkrs_for_dom, dom)
