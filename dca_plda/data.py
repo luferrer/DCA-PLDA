@@ -170,14 +170,14 @@ class TrialLoader(object):
         self.domains = list(self.spki.keys())
         
         self.num_spkrs_per_dom = dict()
+        self.num_spkrs_per_batch = int(batch_size/num_samples_per_spk)
         for dom in self.domains:
             if balance_by_domain == 'num_classes_per_dom_prop_to_its_total_num_classes':
-                # In this case, each domain will have a number of samples that is proporcional to
+                # In this case, each domain will have a number of samples that is proportional to
                 # the number of classes that domain has
-                self.num_spkrs_per_dom[dom] = len(self.spkrs_for_dom[dom])
+                self.num_spkrs_per_dom[dom] = int(np.ceil(len(self.spkrs_for_dom[dom]) * self.num_spkrs_per_batch / sum([len(s) for s in self.spkrs_for_dom.values()])))
             elif balance_by_domain is True or balance_by_domain == 'same_num_classes_per_dom':
                 # In this case, each domain has the same number of speakers
-                self.num_spkrs_per_batch    = int(batch_size/num_samples_per_spk)
                 self.num_spkrs_per_dom[dom] = int(np.ceil(self.num_spkrs_per_batch/len(self.domains)))
             elif balance_by_domain is not False or balance_by_domain is not None:
                 raise Exception("Option for balance_by_domain (%s) not implemented"%balance_by_domain)
@@ -186,7 +186,7 @@ class TrialLoader(object):
 
         self.device = device
         print("Done Initializing trial loader")
-        print("Will create %d batches per epoch using %s samples"%(num_batches, self.embeddings.shape[0]), flush=True)
+        print("Will create %d batches of size %d per epoch using %s samples"%(num_batches, batch_size, self.embeddings.shape[0]), flush=True)
 
     def _init_index_and_list(self, key_fields, list_field, min_len = 1):
         list_dict = dict()
@@ -249,6 +249,7 @@ class TrialLoader(object):
 
             metadata_for_batch = dict([(f, self._np_to_torch(v[sel_idxs])) for f,v in self.metadata.items()])
 
+            assert len(sel_idxs) == self.batch_size
             yield self._np_to_torch(self.embeddings[sel_idxs]), metadata_for_batch
 
         if self.balance_by_domain:
