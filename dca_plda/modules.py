@@ -39,25 +39,40 @@ def compute_loss(llrs, metadata=None, ptar=0.01, mask=None, loss_type='cross_ent
     labels = same_spk[valid]
     labels = labels.type(logits.type())
 
-    # The loss will be given by tar_weight * tar_loss + imp_weight * imp_loss
     ptart = torch.as_tensor(ptar)
-    tar_weight = ptart/torch.sum(labels==1) if torch.sum(labels==1)>0 else 0.0
-    imp_weight = (1-ptart)/torch.sum(labels==0) if torch.sum(labels==0)>0 else 0.0
+    tarw = (labels == 1).float()
+    impw = (labels == 0).float()
+    
+    if "weighted" in loss_type:
+        # Weights are given by the inverse of the number of times that each enrollment model 
+        # occurs in the data
+        weights = 1/torch.sum(same_spk, axis=1, keepdim=True).float()
+        weights *= len(weights)/sum(weights)
+        weights = (weights * torch.ones_like(same_spk))[valid]
+        tarw *= weights
+        impw *= weights
+    
+    # The loss will be given by tar_weight * tar_loss + imp_weight * imp_loss
+    tar_weight = tarw *    ptart /torch.sum(tarw) if torch.sum(tarw)>0 else 0.0
+    imp_weight = impw * (1-ptart)/torch.sum(impw) if torch.sum(impw)>0 else 0.0
 
     # Finally, compute the loss and multiply it by the weight that corresponds to the impostors
     # Loss types are taken from Niko Brummer's paper: "Likelihood-ratio calibration using prior-weighted proper scoring rules"
-    if loss_type == "cross_entropy":
+    if loss_type == "cross_entropy" or loss_type == "weighted_cross_entropy":
         baseline_loss = -ptar*np.log(ptar) - (1-ptar)*np.log(1-ptar)
 #        criterion = nn.BCEWithLogitsLoss(pos_weight=tar_weight/imp_weight, reduction='sum')
 #        loss = criterion(logits, labels)*imp_weight/baseline_loss
         criterion = nn.BCEWithLogitsLoss(reduction='none')
         losses = criterion(logits, labels)
-        loss = torch.sum(labels*tar_weight*losses + (1-labels)*imp_weight*losses)/baseline_loss
+        loss = torch.sum(tar_weight*losses + imp_weight*losses)/baseline_loss
 
-    elif loss_type == "brier":
+    elif loss_type == "brier" or loss_type == "weighted_brier":
         baseline_loss = ptar * (1-ptar)**2 + (1-ptar) * ptar**2
         posteriors = torch.sigmoid(logits)
-        loss = torch.sum(labels*tar_weight*(1-posteriors)**2 + (1-labels)*imp_weight*posteriors**2)/baseline_loss
+        loss = torch.sum(tar_weight*(1-posteriors)**2 + imp_weight*posteriors**2)/baseline_loss
+
+    else:
+        raise Exception("Unknown loss_type %s"%loss_type)
 
     if return_info:
         return loss, llrs, labels
