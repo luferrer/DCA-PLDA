@@ -213,8 +213,13 @@ def load_model(file, device):
 
     loaded_dict = torch.load(file, map_location=device)
     config = loaded_dict['config']
-    in_size = loaded_dict['model']['lda_stage.W'].shape[0]
-
+    if 'front_stage.W' in loaded_dict['model']:
+        # If there is a front stage, get the in_size from there
+        in_size = loaded_dict['model']['front_stage.W'].shape[0]
+    else:
+        # Else, get it from the lda stage
+        in_size = loaded_dict['model']['lda_stage.W'].shape[0]
+    
     model = modules.DCA_PLDA_Backend(in_size, config)
     model.load_state_dict(loaded_dict['model'])
 
