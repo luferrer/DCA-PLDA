@@ -30,7 +30,6 @@ default_config = {
         'num_epochs': 50,
         'num_samples_per_spk': 2,
         'num_batches_per_epoch': 1000,
-        'balance_batches_by_domain': False,
         'compute_ave_model': False}}
 
 
@@ -75,7 +74,9 @@ def load_data_dict(table, device, fixed_enrollment_ids=None):
         dataset = SpeakerDataset(emb, dur, meta_is_dur_only=True, device=device)
         if fixed_enrollment_ids is not None:
             # Enrollment embeddings are part of the model, not provided in the data
-            assert emapf == 'NONE'
+            # Hence, emapf in this case should either be NONE, in which case, all
+            # detectors are used, or some subset of fixed_enrollment_ids, in which
+            # case only that subset is used
             emap = IdMap.load(emapf, fixed_enrollment_ids)
         else:
             emap = IdMap.load(emapf, dataset.get_ids())
