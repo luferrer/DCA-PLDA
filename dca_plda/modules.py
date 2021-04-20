@@ -41,15 +41,19 @@ def compute_loss(llrs, metadata=None, ptar=0.01, mask=None, loss_type='cross_ent
 
     # The loss will be given by tar_weight * tar_loss + imp_weight * imp_loss
     ptart = torch.as_tensor(ptar)
-    tar_weight = ptart/torch.sum(labels==1)
-    imp_weight = (1-ptart)/torch.sum(labels==0)
+    tar_weight = ptart/torch.sum(labels==1) if torch.sum(labels==1)>0 else 0.0
+    imp_weight = (1-ptart)/torch.sum(labels==0) if torch.sum(labels==0)>0 else 0.0
 
     # Finally, compute the loss and multiply it by the weight that corresponds to the impostors
     # Loss types are taken from Niko Brummer's paper: "Likelihood-ratio calibration using prior-weighted proper scoring rules"
     if loss_type == "cross_entropy":
-        criterion = nn.BCEWithLogitsLoss(pos_weight=tar_weight/imp_weight, reduction='sum')
         baseline_loss = -ptar*np.log(ptar) - (1-ptar)*np.log(1-ptar)
-        loss = criterion(logits, labels)*imp_weight/baseline_loss
+#        criterion = nn.BCEWithLogitsLoss(pos_weight=tar_weight/imp_weight, reduction='sum')
+#        loss = criterion(logits, labels)*imp_weight/baseline_loss
+        criterion = nn.BCEWithLogitsLoss(reduction='none')
+        losses = criterion(logits, labels)
+        loss = torch.sum(labels*tar_weight*losses + (1-labels)*imp_weight*losses)/baseline_loss
+
     elif loss_type == "brier":
         baseline_loss = ptar * (1-ptar)**2 + (1-ptar) * ptar**2
         posteriors = torch.sigmoid(logits)
@@ -69,6 +73,12 @@ class DCA_PLDA_Backend(nn.Module):
         super().__init__()
         lda_dim = config.lda_dim
         self.config = config
+        front_dim = self.config.get('front_dim')
+
+        if front_dim:
+            # Affine layer at the front (used to fine tune the 6th layer in the embedding extractor)
+            self.front_stage = Affine(in_dim, front_dim)
+            in_dim = front_dim
 
         self.lda_stage  = Affine(in_dim, lda_dim, "l2norm")
 
@@ -126,6 +136,10 @@ class DCA_PLDA_Backend(nn.Module):
 
         hase = xe is not None
 
+        if hasattr(self, 'front_stage'):
+            xe = self.front_stage(xe) if hase else None
+            xt = self.front_stage(xt)
+
         x2e = self.lda_stage(xe) if hase else None
         x2t = self.lda_stage(xt) 
         
@@ -180,7 +194,17 @@ class DCA_PLDA_Backend(nn.Module):
             speaker_ids = meta['speaker_id']
             domain_ids  = meta['domain_id']
             x_torch = utils.np_to_torch(x, device)
-            
+        
+            if hasattr(self,'front_stage'):
+                params_to_init_front_stage = config.get("params_to_init_front_stage")
+                if params_to_init_front_stage:
+                    # Read the params from an npz file
+                    self.front_stage.init_with_params(np.load(params_to_init_front_stage))
+                else:
+                    self.front_stage.init_random(init_params.get('stdev',0.1))
+                x_torch = self.front_stage(x_torch)
+                x = x_torch.cpu().numpy()
+                
             if init_params.get("random"):
                 self.lda_stage.init_random(init_params.get('stdev',0.1))
             else:
@@ -234,15 +258,20 @@ class DCA_PLDA_Backend(nn.Module):
                 self.plda_stage.init_with_plda(x2, speaker_ids, init_params, domain_ids=domain_ids)
                 if self.enrollment is not None:
                     # idx_to_str['speaker_id_inv'] contains a mapping from string to indices corresponding to the speaker_ids array
+                    weights = compute_weights(speaker_ids, domain_ids, init_params.get('balance_by_domain'))
+                    w = weights['sample_weights'][:,np.newaxis]
                     speaker_ids_onehot = utils.onehot_for_class_ids(speaker_ids, self.enrollment_classes, idx_to_str['speaker_id_inv'])
-                    self.enrollment.init_with_weighted_means(x2, speaker_ids_onehot)
+                    self.enrollment.init_with_weighted_means(x2, speaker_ids_onehot * w)
 
             # Since the training data is usually large, we cannot create all possible trials for x3.
             # So, to create a bunch of trials, we just create a trial loader with a large batch size.
-            # This means we need to rerun lda again, but it is a small price to pay for the 
+            # This means we need to rerun the front stage and lda again, but it is a small price to pay for the 
             # convenience of reusing the machinery of trial creation in the TrialLoader.
             loader = ddata.TrialLoader(dataset, device, seed=0, batch_size=2000, num_batches=1, balance_by_domain=balance_by_domain, subset=subset)
             x_torch, meta_batch = next(loader.__iter__())
+            if hasattr(self,'front_stage'):
+                x_torch = self.front_stage(x_torch)
+                x = x_torch.cpu().numpy()
             x2_torch = self.lda_stage(x_torch)
             scrs_torch = self.plda_stage(x2_torch)
             same_spk_torch, valid_torch = utils.create_scoring_masks(meta_batch)
@@ -531,7 +560,7 @@ class Quadratic(nn.Module):
         # Compute a PLDA model with the input data, approximating the 
         # model with just the usual initialization without the EM iterations
 
-        weights = compute_class_weights(speaker_ids, domain_ids, init_params.get('balance_by_domain'))
+        weights = compute_weights(speaker_ids, domain_ids, init_params.get('balance_by_domain'))
 
         # Debugging of weight usage in PLDA:
         # Repeat the data from the first 5000 speakers twice either explicitely or through the weights
@@ -548,9 +577,23 @@ class Quadratic(nn.Module):
         #assert np.allclose(BCov2,BCov3)
         #assert np.allclose(WCov2,WCov3)
         #assert np.allclose(mu2, mu3)
-                        
+
+        # Use the cross-product between speaker and domain ids for initializing LDA and PLDA
+        # This can be used to be able to increase the LDA dimension beyond the number of available
+        # speakers (or languages)
+        if init_params.get('lda_by_class_x_domain'):
+            # Replace the class_ids with new indices that correspond to the cross-product between
+            # class_ids and sec_ids. In this case, the balance_by_domain option does not make sense
+            assert init_params.get('balance_by_domain') is not True
+            _, init_ids = np.unique([str(s)+','+str(c) for s,c in zip(speaker_ids, domain_ids)], return_inverse=True)
+            # Need to recompute the weights (which will all be 1.0 since balance_by_domain is false), since
+            # we now have more classes
+            weights = compute_weights(init_ids, domain_ids, init_params.get('balance_by_domain'))
+        else:
+            init_ids = None
+
         # Bi and Wi are the between and within covariance matrices and mu is the global (weighted) mean
-        Bi, Wi, mu = compute_2cov_plda_model(x, speaker_ids, weights, init_params.get('plda_em_its',0))
+        Bi, Wi, mu = compute_2cov_plda_model(x, speaker_ids, weights, init_params.get('plda_em_its',0), init_ids=init_ids)
         
         # Equations (14) and (16) in Cumani's paper 
         # Note that the paper has an error in the formula for k (a 1/2 missing before k_tilde) 
@@ -610,12 +653,21 @@ class Affine(nn.Module):
             raise Exception("Activation %s not implemented"%self.activation)
         return out
 
+    def init_with_params(self, param_dict):
+        utils.replace_state_dict(self, param_dict)
+
     def init_with_lda(self, x, class_ids, init_params, complement=True, sec_ids=None, gaussian_backend=False):
 
         if self.has_bias is False:
             raise Exception("Cannot initialize this component with init_with_lda because it was created with bias=False")
 
-        weights = compute_class_weights(class_ids, sec_ids, init_params.get('balance_by_domain'))
+        if init_params.get('lda_by_class_x_domain'):
+            # Replace the class_ids with new indices that correspond to the cross-product between
+            # class_ids and sec_ids. In this case, the balance_by_domain option does not make sense
+            assert init_params.get('balance_by_domain') is not True
+            _, class_ids = np.unique([str(s)+','+str(c) for s,c in zip(class_ids, sec_ids)], return_inverse=True)
+
+        weights = compute_weights(class_ids, sec_ids, init_params.get('balance_by_domain'))
 
         BCov, WCov, GCov, mu, mu_per_class, _ = compute_lda_model(x, class_ids, weights)
 
@@ -697,12 +749,15 @@ class SimpleNN(nn.Module):
 
 
 
-def compute_2cov_plda_model(x, class_ids, class_weights, em_its=0):
+def compute_2cov_plda_model(x, class_ids, class_weights, em_its=0, init_ids=None):
     """ Follows the "EM for SPLDA" document from Niko Brummer:
     https://sites.google.com/site/nikobrummer/EMforSPLDA.pdf
     """
 
-    BCov, WCov, GCov, mu, muc, stats = compute_lda_model(x, class_ids, class_weights)
+    if init_ids is None:
+        init_ids = class_ids
+
+    BCov, WCov, GCov, mu, muc, stats = compute_lda_model(x, init_ids, class_weights)
     W = utils.CholInv(WCov)
     v, e = linalg.eig(BCov)
     V = e * np.sqrt(np.real(v))
@@ -728,18 +783,18 @@ def compute_2cov_plda_model(x, class_ids, class_weights, em_its=0):
             # The expression below is a robust way for solving 
             # yy_sum = len(idxs)*Linv + np.dot(y_hat[:, idxs], y_hat[:, idxs].T)
             # while avoiding doing the inverse of L which can create numerical issues
-            n_spkrs = np.sum(stats.weights[idxs])
-            yy_sum = np.linalg.solve(L, n_spkrs * np.eye(V.shape[0]) + L @ y_hat[:, idxs] @ (y_hat[:, idxs].T * stats.weights[idxs]))
+            n_spkrs = np.sum(stats.cweights[idxs])
+            yy_sum = np.linalg.solve(L, n_spkrs * np.eye(V.shape[0]) + L @ y_hat[:, idxs] @ (y_hat[:, idxs].T * stats.cweights[idxs]))
             R += n*yy_sum
             llk += 0.5 * n_spkrs * Linv.logdet()
-        T = y_hat @ (stats.F * stats.weights)
-        llk += 0.5*np.trace(T @ VtW.T) + 0.5 * np.sum(stats.N*stats.weights) * W.logdet() - 0.5 * np.trace(W @ stats.S)
-        return R, T, llk/np.sum(stats.N*stats.weights)
+        T = y_hat @ (stats.F * stats.cweights)
+        llk += 0.5*np.trace(T @ VtW.T) + 0.5 * np.sum(stats.N*stats.cweights) * W.logdet() - 0.5 * np.trace(W @ stats.S)
+        return R, T, llk/np.sum(stats.N*stats.cweights)
 
     prev_llk = 0.0
     for it in range(em_its):
         R, T, llk = estep(stats, V, W)
-        V, W, WCov = mstep(R, T, stats.S, np.sum(stats.N*stats.weights))
+        V, W, WCov = mstep(R, T, stats.S, np.sum(stats.N*stats.cweights))
         print("EM it %d LLK = %.5f (+%.5f)" % (it, llk, llk-prev_llk))
         prev_llk = llk 
     
@@ -747,17 +802,21 @@ def compute_2cov_plda_model(x, class_ids, class_weights, em_its=0):
 
     return BCov, WCov, np.atleast_2d(mu)
 
-def compute_stats(x, class_ids, class_weights):
+def compute_stats(x, class_ids, class_weights, sample_weights):
     # Zeroth, first and second order stats per speaker, considering that
     # each speaker is weighted by the provided weights
+    
     stats     = utils.AttrDict(dict())
     nsamples  = class_ids.shape[0]
     classmat  = coo_matrix((np.ones(nsamples), (class_ids, np.arange(nsamples)))).tocsr()
-    stats.weights = np.atleast_2d(class_weights).T
+    stats.cweights = np.atleast_2d(class_weights).T
+    stats.sweights = np.atleast_2d(sample_weights).T / np.sum(sample_weights) * float(nsamples)
+    sweightsdiag   = dia_matrix((stats.sweights.squeeze(),0),shape=(nsamples,nsamples))
+    classmat_sw    = classmat.dot(sweightsdiag) # Matrix with one row per speaker and one col per sample, with the weights as entries
 
     # Global mean, considering that each speaker's data should be 
     # multiplied by the corresponding weight for that speaker
-    sample_weights = stats.weights[class_ids]
+    sample_weights = stats.cweights[class_ids] * stats.sweights
     stats.mu       = np.array(sample_weights.T @ x) / np.sum(sample_weights) 
 
     # N and F are stats per speaker, weights are not involved in the computation of those. 
@@ -765,14 +824,17 @@ def compute_stats(x, class_ids, class_weights):
     # has to be weighted by the corresponding weight
     xcent     = x - stats.mu
     xcentw    = xcent * sample_weights
-    stats.N   = np.array(classmat.sum(1)) 
-    stats.F   = np.array(classmat @ xcent)
+    stats.N   = np.array(classmat_sw.sum(1)) 
+    stats.F   = np.array(classmat_sw @ xcent)
     stats.S   = xcent.T @ xcentw
 
     return stats
 
 
-def compute_lda_model(x, class_ids, class_weights):
+def compute_lda_model(x, class_ids, weights):
+
+    class_weights = weights['speaker_weights']
+    sample_weights = weights['sample_weights']
 
     # Simpler code using sklearn. We are not using this because it does not allow for weights
     # lda = discriminant_analysis.LinearDiscriminantAnalysis(store_covariance=True)
@@ -782,7 +844,7 @@ def compute_lda_model(x, class_ids, class_weights):
     # mu = np.mean(x, axis=0)
     # GCov should be the same as np.cov(x.T,  bias=1)
 
-    stats = compute_stats(x, class_ids, class_weights)
+    stats = compute_stats(x, class_ids, class_weights, sample_weights)
 
     # Once we have the stats, we do not need x or class_ids any more (we still do need the class weights)
     mu    = stats.mu
@@ -794,9 +856,9 @@ def compute_lda_model(x, class_ids, class_weights):
 
     # BCov and GCov are computed by weighting the contribution of each speaker with 
     # the provided weights
-    Ntot  = np.sum(np.multiply(stats.N, stats.weights))
+    Ntot  = np.sum(np.multiply(stats.N, stats.cweights))
     Fs    = stats.F / np.sqrt(stats.N) 
-    BCov  = Fs.T @ (Fs * stats.weights) / Ntot
+    BCov  = Fs.T @ (Fs * stats.cweights) / Ntot
     GCov  = stats.S / Ntot
     WCov  = GCov - BCov
 
@@ -804,15 +866,33 @@ def compute_lda_model(x, class_ids, class_weights):
 
 
 
-def compute_class_weights(speaker_ids, domain_ids, balance_by_domain=False):
+def compute_weights(speaker_ids, domain_ids, balance_by_domain=False):
+    
+    spk_weights = None
+    sample_weights = None
+
+    if balance_by_domain == 'num_classes_per_dom_prop_to_its_total_num_classes':
+        # Assign one weight per sample, so that all classes in each domain and
+        # accross domains weight the same. That is, each sample is weighted by
+        # the inverse of the number of samples for that language and domain.
+        # If all classes appear in a single domain, this is very similar to
+        # the per-speaker implementation of the weights below.
+        # This can also be used to balance out the language-id samples so that all 
+        # languages have the same equivalent number of samples for each domain they 
+        # appear in.
+        _, unique_sids_x_doms = np.unique([str(s)+','+str(c) for s,c in zip(speaker_ids, domain_ids)], return_inverse=True)
+        weight_per_sid_x_dom = 1.0/np.bincount(unique_sids_x_doms)
+        weight_per_sid_x_dom *= len(weight_per_sid_x_dom)/np.sum(weight_per_sid_x_dom)
+        sample_weight =  weight_per_sid_x_dom[unique_sids_x_doms]
+    else:
+        sample_weight = np.ones_like(speaker_ids, dtype=float)
 
     unique_sids = np.unique(speaker_ids)
     unique_doms = np.unique(domain_ids)
-    
-    # The weight for each domain is given by the inverse of the number of speakers for that domain    
     dom_weight = np.ones_like(unique_doms, dtype=float)
     for d in unique_doms:
-        if balance_by_domain:
+        if balance_by_domain is True or balance_by_domain == 'same_num_classes_per_dom':
+            # The weight for each domain is given by the inverse of the number of speakers for that domain    
             # If all domains have the same number of speakers, then all weights are 1.0
             dom_weight[d] = len(unique_sids)*1.0/len(np.unique(speaker_ids[domain_ids==d]))/len(unique_doms)
         else:
@@ -828,4 +908,5 @@ def compute_class_weights(speaker_ids, domain_ids, balance_by_domain=False):
 
     print("Weights per domain: %s"%dom_weight)
 
-    return spk_weight
+    return {'speaker_weights': spk_weight, 'sample_weights': sample_weight}
+
