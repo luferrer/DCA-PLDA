@@ -61,9 +61,12 @@ def train(model, loader, optimizer, epoch, config, debug_dir=None):
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_norm)
         optimizer.step()
 
-        total_loss += loss
-        total_regt += regt
-        total_regl += regl
+        total_loss += loss.detach()
+        if l2_reg_dict is not None:
+            total_regt += regt.detach() 
+        if llr_reg_dict is not None:
+            total_regl += regl.detach() 
+
         total_batches += 1
         if batch_idx % freq == 0 and batch_idx>0:
             print("  Epoch %04d, batch %04d, ave loss %f, ave l2 reg term %f, ave logit reg term %f"%
@@ -201,6 +204,7 @@ def save_checkpoint(model, outdir, epoch=None, trn_loss=None, dev_loss=None, opt
 
     print("Saving model in %s"%outfile)
     save_dict = {'model': model.state_dict(), 
+                 'in_dim': model.in_dim,
                  'config': model.config,
                  'optimizer': optimizer.state_dict() if optimizer is not None else None,
                  'scheduler': scheduler.state_dict() if scheduler is not None else None}
@@ -213,13 +217,22 @@ def load_model(file, device):
 
     loaded_dict = torch.load(file, map_location=device)
     config = loaded_dict['config']
-    if 'front_stage.W' in loaded_dict['model']:
-        # If there is a front stage, get the in_size from there
-        in_size = loaded_dict['model']['front_stage.W'].shape[0]
+
+    if 'in_dim' in loaded_dict:
+        in_size = loaded_dict['in_dim']
     else:
-        # Else, get it from the lda stage
-        in_size = loaded_dict['model']['lda_stage.W'].shape[0]
-    
+        # Backward compatibility with old models that did not save in_dim
+        if 'front_stage.W' in loaded_dict['model']:
+            # If there is a front stage, get the in_size from there
+            in_size = loaded_dict['model']['front_stage.W'].shape[0]
+        elif 'lda_stage.W' in loaded_dict['model']:
+            # Get it from the lda stage
+            in_size = loaded_dict['model']['lda_stage.W'].shape[0]
+        elif 'plda_stage.F' in loaded_dict['model']:
+            in_size = loaded_dict['model']['plda_stage.F'].shape[0]
+        else:
+            raise Exception("Cannot infer input dimension for this model")
+
     model = modules.DCA_PLDA_Backend(in_size, config)
     model.load_state_dict(loaded_dict['model'])
 
@@ -474,6 +487,9 @@ def get_parameters_to_train(model, freeze_params=None):
 
 
 def expand_regexp_dict(named_parameters, regexp_dict, name='l2_reg'):
+
+    if regexp_dict is None:
+        return None
 
     expanded_dict = dict()
 
