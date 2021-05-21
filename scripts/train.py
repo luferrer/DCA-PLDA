@@ -126,8 +126,7 @@ else:
     device = torch.device("cpu")
 
 ###### Load the dataset and create the model object
-trn_metafiles = opt.trn_metafile.split(",")
-trn_dataset = SpeakerDataset(opt.trn_embeddings, trn_metafiles[0])
+trn_dataset = SpeakerDataset(opt.trn_embeddings, opt.trn_metafile)
 in_size = trn_dataset[0]['emb'].shape[0]
 config.architecture['fixed_enrollment_ids'] = opt.detectors
 model = DCA_PLDA_Backend(in_size, config.architecture).to(device)
