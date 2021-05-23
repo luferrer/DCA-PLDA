@@ -142,6 +142,20 @@ class TrialLoader(object):
         """
         Args:
             dataset: an object of class SpeakerDataset 
+            device: device where to move the created batches
+            batch_size: size of batches to create
+            num_batches: number of batches to create
+            balance_by_domain: balance the batches by domain. If set to 'num_classes_per_dom_prop_to_its_total_num_classes', 
+            each class/domain pair will get the same number of samples per batch. Otherwise, if set to any other value except None or
+            False, it will generate the same number of samples per domain.
+            seed: seed for randomization of lists
+            num_samples_per_spk: minimum number of samples per speaker per batch. If the number of speakers is small, speakers
+            might repeat more than this number within each batch in order to fill in the batch.
+            subset: subset of samples in dataset to use for batch generation
+            enrollment_samples_per_spk: list of number of samples to use to create models for each speaker. For example, if set to 
+            [1,1,3], an enrollment map will be created that includes, for each speaker, two models with one sample each and one model 
+            with three samples. Note that, in order to create a 3-sample model that can be tested against at least one unseen sample 
+            from that speaker, num_samples_per_spk has to be at least 4.
         """
         print("Initializing trial loader (this might take a while for big datasets but this process saves time during training).")
         self.embeddings, self.metadata, self.metamaps = dataset.get_data_and_meta(subset=subset)
@@ -176,11 +190,9 @@ class TrialLoader(object):
                 # In this case, each domain will have a number of samples that is proportional to
                 # the number of classes that domain has
                 self.num_spkrs_per_dom[dom] = int(np.ceil(len(self.spkrs_for_dom[dom]) * self.num_spkrs_per_batch / sum([len(s) for s in self.spkrs_for_dom.values()])))
-            elif balance_by_domain is True or balance_by_domain == 'same_num_classes_per_dom':
+            else:
                 # In this case, each domain has the same number of speakers
                 self.num_spkrs_per_dom[dom] = int(np.ceil(self.num_spkrs_per_batch/len(self.domains)))
-            elif balance_by_domain is not False or balance_by_domain is not None:
-                raise Exception("Option for balance_by_domain (%s) not implemented"%balance_by_domain)
 
         self.sample_to_idx = dict(np.c_[self.metadata['sample_id'], np.arange(len(self.metadata['sample_id']))])
 
