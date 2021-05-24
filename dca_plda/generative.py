@@ -1,4 +1,4 @@
-# Most of the code in this file was written by Niko Brummer and slightly modified by me
+# The code for training heavy-tail PLDA in this file was written by Niko Brummer
 
 import torch
 import torch.nn as nn

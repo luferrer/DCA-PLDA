@@ -1,4 +1,5 @@
-# The code in this file was written by Niko Brummer
+# The code in this file was written by Niko Brummer. 
+# Luciana Ferrer added the functionality to (approximately) score with stats.
 
 import torch
 from IPython import embed
