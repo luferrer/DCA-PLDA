@@ -9,6 +9,8 @@ from scipy.sparse import coo_matrix, dia_matrix
 import utils 
 import data as ddata 
 import calibration
+import htplda
+from generative import *
 from scipy import linalg
 
 def compute_loss(llrs, metadata=None, ptar=0.01, mask=None, loss_type='cross_entropy', return_info=False, 
@@ -86,25 +88,57 @@ class DCA_PLDA_Backend(nn.Module):
         Implements the PLDA branch which includes: a linear transform, length-norm and a PLDA-like transform
         """
         super().__init__()
-        lda_dim = config.lda_dim
         self.config = config
-        front_dim = self.config.get('front_dim')
+        self.in_dim = in_dim
 
+        front_dim = self.config.get('front_dim')
         if front_dim:
             # Affine layer at the front (used to fine tune the 6th layer in the embedding extractor)
             self.front_stage = Affine(in_dim, front_dim)
             in_dim = front_dim
 
-        self.lda_stage  = Affine(in_dim, lda_dim, "l2norm")
+        lda_dim = self.config.get('lda_dim')
+        if lda_dim:
+            # LDA stage enabled by default. 
+            self.lda_stage  = Affine(in_dim, lda_dim, "l2norm")
+        else:
+            lda_dim = in_dim
 
-        self.plda_stage = Quadratic(lda_dim)
+        plda_type = self.config.get('plda_type', 'quadratic_form') 
+
+        if plda_type == 'quadratic_form':
+            # In this case, the PLDA stage is given by the quadratic form (or, rather, second order
+            # polynomial) that corresponds to the score computation for Gaussian PLDA.
+            # Note that, in this case, the parameters are those of the quadratic form, rather than
+            # those of the original Gaussian PLDA model (the between and within class covariance 
+            # matrices). Even though we initialize the parameters of the quadratic form using the
+            # covariance matrices estimated with the EM algorithm, after discriminative training the 
+            # parameters may no longer correspond to valid covariance matrices. Hence, we loose the 
+            # probabilistic interpretation of the PLDA model.  
+            self.plda_stage = Quadratic(lda_dim)
+
+        elif plda_type == 'quadratic_form_non_symmetric_L':
+            # Allow L to be assymetric after discriminative training
+            self.plda_stage = Quadratic(lda_dim, non_symmetric_L=True)
+        
+        elif plda_type == 'heavy_tailed_plda':
+            # In this case, the PLDA stage is given by the HT-PLDA formulation and uses the parameters
+            # of the generative model: F and Cw. Hence, after discriminative training, we can still
+            # use the resulting model to compute all sorts of probabilities. 
+            # Note that, when nu tends to infinity, this model degenerates to Gaussian PLDA, but it 
+            # will not coincide with the model above because the parameterization is different.
+            self.plda_stage = HTPLDA(lda_dim, rank=self.config.get('htplda_rank', lda_dim))
+        
+        else:   
+            raise Exception("Plda_type %s no implemented"%plda_type)
 
         if self.config.get('fixed_enrollment_ids'):
             # In this case, the enrollment vectors are pre-defined and another parameter of the model
             # Use the Affine class for this. Only the W of and the init methods of that class are used, not the forward.
             # Read the list of enrollment classes from a text file provided in the config.
             self.enrollment_classes = [l.strip().split()[0] for l in open(self.config.get('fixed_enrollment_ids')).readlines()]
-            self.enrollment = Affine(lda_dim, len(self.enrollment_classes), bias=False)
+            #self.enrollment = Affine(lda_dim, len(self.enrollment_classes), bias=False)
+            self.enrollment = Stats(lda_dim, len(self.enrollment_classes))
         else:
             self.enrollment_classes = None
             self.enrollment = None
@@ -155,9 +189,13 @@ class DCA_PLDA_Backend(nn.Module):
             xe = self.front_stage(xe) if hase else None
             xt = self.front_stage(xt)
 
-        x2e = self.lda_stage(xe) if hase else None
-        x2t = self.lda_stage(xt) 
-        
+        if hasattr(self, 'lda_stage'):
+            x2e = self.lda_stage(xe) if hase else None
+            x2t = self.lda_stage(xt) 
+        else:
+            x2e = xe
+            x2t = xt
+
         if hasattr(self,'si_stage1'):
             si_inpute = xe if self.si_input == 'main_input' else x2e
             si_inputt = xt if self.si_input == 'main_input' else x2t
@@ -183,11 +221,12 @@ class DCA_PLDA_Backend(nn.Module):
 
             if self.enrollment is not None:
                 assert xe is None and dure is None and sie is None
-                scrs = self.plda_stage.score(x2t, self.enrollment.W.T)
+                #scrs = self.plda_stage.score(x2t, self.enrollment.W.T)
+                scrs = self.plda_stage.score_with_stats(x2t, self.enrollment)
                 # In this case, there is no dur or si for the enrollment side. 
                 # Set them to a vector of constants 
-                dure = 2*torch.ones(scrs.shape[0]).to(scrs.device) if durt is not None else None
-                sie = torch.ones([scrs.shape[0], sit.shape[1]]).to(scrs.device) if sit is not None else None
+                dure = torch.ones(scrs.shape[0]).to(scrs.device) if durt is not None else None
+                sie  = torch.ones([scrs.shape[0], sit.shape[1]]).to(scrs.device) if sit is not None else None
             else:
                 scrs = self.plda_stage.score(x2t, x2e)
 
@@ -206,9 +245,10 @@ class DCA_PLDA_Backend(nn.Module):
         with torch.no_grad():
 
             x, meta, idx_to_str = dataset.get_data_and_meta(subset)
+            x = utils.np_to_torch(x, device)
+
             speaker_ids = meta['speaker_id']
             domain_ids  = meta['domain_id']
-            x_torch = utils.np_to_torch(x, device)
         
             if hasattr(self,'front_stage'):
                 params_to_init_front_stage = config.get("params_to_init_front_stage")
@@ -217,38 +257,36 @@ class DCA_PLDA_Backend(nn.Module):
                     self.front_stage.init_with_params(np.load(params_to_init_front_stage))
                 else:
                     self.front_stage.init_random(init_params.get('stdev',0.1))
-                x_torch = self.front_stage(x_torch)
-                x = x_torch.cpu().numpy()
+                x = self.front_stage(x)
                 
-            if init_params.get("random"):
-                self.lda_stage.init_random(init_params.get('stdev',0.1))
+            if hasattr(self,'lda_stage'):
+                if init_params.get("random"):
+                    self.lda_stage.init_random(init_params.get('stdev',0.1))
+                else:
+                    self.lda_stage.init_with_lda(x.cpu().numpy(), speaker_ids, init_params, sec_ids=domain_ids)
+                x2 = self.lda_stage(x)
             else:
-                self.lda_stage.init_with_lda(x, speaker_ids, init_params, sec_ids=domain_ids)
-
-            x2_torch = self.lda_stage(x_torch)
-            x2 = x2_torch.cpu().numpy()
+                x2 = x
 
             if hasattr(self,'si_stage1'):
                 if self.si_input == 'main_input':
-                    si_input_torch = x_torch
                     si_input = x
                 else:
-                    si_input_torch = x2_torch
                     si_input = x2
 
                 if init_params.get("random"):
                     self.si_stage1.init_random(init_params.get('stdev',0.1))
                 else:
-                    self.si_stage1.init_with_lda(si_input, speaker_ids, init_params, sec_ids=domain_ids, complement=True)
+                    self.si_stage1.init_with_lda(si_input.cpu().numpy(), speaker_ids, init_params, sec_ids=domain_ids, complement=True)
 
-                s2_torch = self.si_stage1(si_input_torch)
+                s2 = self.si_stage1(si_input)
                     
                 if init_params.get('init_si_stage2_with_domain_gb', False):
                     # Initialize the second stage of the si-extractor to be a gaussian backend that predicts
                     # the posterior of each domain. In this case, the number of domains has to coincide with the
                     # dimension of the side info vector
                     assert self.si_dim == len(np.unique(domain_ids))
-                    self.si_stage2.init_with_lda(s2_torch.cpu().numpy(), domain_ids, init_params, sec_ids=speaker_ids, gaussian_backend=True)
+                    self.si_stage2.init_with_lda(s2.cpu().numpy(), domain_ids, init_params, sec_ids=speaker_ids, gaussian_backend=True)
     
                 else:
                     # This is the only component that is initialized randomly unless otherwise indicated by the variable "init_si_stage2_with_domain_gb"
@@ -256,55 +294,57 @@ class DCA_PLDA_Backend(nn.Module):
 
                 if hasattr(self,'shift_selector'):
                     # Initialize the shifts as the mean of the lda outputs weighted by the si
-                    si_torch = self.si_stage2(s2_torch)
-                    si = si_torch.cpu().numpy()
+                    si = self.si_stage2(s2)
                     if init_params.get("random"):
                         self.shift_selector.init_random(init_params.get('stdev',0.1))
                     else:
-                        self.shift_selector.init_with_weighted_means(x2, si)
-                    x2_torch -= self.shift_selector(si_torch)
-                    x2 = x2_torch.cpu().numpy()
+                        self.shift_selector.init_with_weighted_means(x2.cpu().numpy(), si.cpu().numpy())
+                    x2 -= self.shift_selector(si)
 
             if init_params.get("random"):
                 self.plda_stage.init_random(init_params.get('stdev',0.1))
                 if self.enrollment is not None:
                     self.enrollment.init_random(init_params.get('stdev',0.1))
             else:    
-                self.plda_stage.init_with_plda(x2, speaker_ids, init_params, domain_ids=domain_ids)
+                self.plda_stage.init_with_plda_trained_generatively(x2.cpu().numpy(), speaker_ids, init_params, domain_ids=domain_ids)
                 if self.enrollment is not None:
-                    # idx_to_str['speaker_id_inv'] contains a mapping from string to indices corresponding to the speaker_ids array
-                    weights = compute_weights(speaker_ids, domain_ids, init_params.get('balance_by_domain'))
-                    w = weights['sample_weights'][:,np.newaxis]
-                    speaker_ids_onehot = utils.onehot_for_class_ids(speaker_ids, self.enrollment_classes, idx_to_str['speaker_id_inv'])
-                    self.enrollment.init_with_weighted_means(x2, speaker_ids_onehot * w)
+                    self.enrollment.init_with_data(x2.cpu().numpy(), speaker_ids, domain_ids, self.enrollment_classes, idx_to_str, init_params)
 
             # Since the training data is usually large, we cannot create all possible trials for x3.
             # So, to create a bunch of trials, we just create a trial loader with a large batch size.
             # This means we need to rerun the front stage and lda again, but it is a small price to pay for the 
             # convenience of reusing the machinery of trial creation in the TrialLoader.
             loader = ddata.TrialLoader(dataset, device, seed=0, batch_size=2000, num_batches=1, balance_by_domain=balance_by_domain, subset=subset)
-            x_torch, meta_batch = next(loader.__iter__())
-            if hasattr(self,'front_stage'):
-                x_torch = self.front_stage(x_torch)
-                x = x_torch.cpu().numpy()
-            x2_torch = self.lda_stage(x_torch)
-            scrs_torch = self.plda_stage(x2_torch)
-            same_spk_torch, valid_torch = utils.create_scoring_masks(meta_batch)
-            scrs, same_spk, valid = [v.detach().cpu().numpy() for v in [scrs_torch, same_spk_torch, valid_torch]]
+            x, meta_batch = next(loader.__iter__())
+            
+            x  = self.front_stage(x) if hasattr(self,'front_stage') else x
+            x2 = self.lda_stage(x)   if hasattr(self,'lda_stage') else x
+            if self.enrollment:
+                scrs = self.plda_stage.score_with_stats(x2, self.enrollment)
+                spk_ids = meta_batch['speaker_id'].type(torch.int)
+                same_spk = utils.onehot_for_class_ids(spk_ids, self.enrollment_classes, idx_to_str['speaker_id_inv']).T.type(torch.bool)
+                valid = torch.ones_like(scrs).type(torch.bool)
+            else:
+                scrs = self.plda_stage.score(x2)
+                # The llrs are assumed to correspond to all vs all trials
+                same_spk, valid = utils.create_scoring_masks(meta_batch)
 
             if init_params.get("random"):
                 self.cal_stage.init_random(init_params.get('stdev',0.1))
             else:
-                self.cal_stage.init_with_logreg(scrs, same_spk, valid, config.ptar, std_for_mats=init_params.get('std_for_cal_matrices',0))
+                scrs_np, same_spk_np, valid_np = [v.detach().cpu().numpy() for v in [scrs, same_spk, valid]]
+                self.cal_stage.init_with_logreg(scrs_np, same_spk_np, valid_np, config.ptar, std_for_mats=init_params.get('std_for_cal_matrices',0))
 
-            dummy_durs = torch.ones(scrs.shape[0]).to(device) 
-            dummy_si = torch.zeros(scrs.shape[0], self.si_dim).to(device)
-            llrs_torch = self.cal_stage(scrs_torch, dummy_durs, dummy_si)
-            mask = np.ones_like(same_spk, dtype=int)
+            dummy_durs_t = torch.ones(scrs.shape[1]).to(device) 
+            dummy_durs_e = torch.ones(scrs.shape[0]).to(device) 
+            dummy_si_t = torch.zeros(scrs.shape[1], self.si_dim).to(device)
+            dummy_si_e = torch.zeros(scrs.shape[0], self.si_dim).to(device)
+            llrs = self.cal_stage.calibrate(scrs, dummy_durs_t, dummy_si_t, dummy_durs_e, dummy_si_e)
+            mask = torch.ones_like(same_spk, dtype=torch.int8)
             mask[~same_spk] = -1
             mask[~valid] = 0
-            
-            return compute_loss(llrs_torch, mask=utils.np_to_torch(mask, device), ptar=config.ptar, loss_type=config.loss)
+
+            return compute_loss(llrs, mask=mask, ptar=config.ptar, loss_type=config.loss)
 
 
 class CA_Calibrator(nn.Module):
@@ -321,12 +361,15 @@ class CA_Calibrator(nn.Module):
         self.config = config
         self.is_sidep = False
         self.is_durdep = False
-
+    
         if self.config:
             self.dur_rep = self.config.get('duration_representation', 'log') 
             self.dur_thresholds = self.config.get('duration_thresholds')
             self.si_cal_first = self.config.get('si_cal_first', True) 
             numdurf = self._process_durs(torch.ones(10), init=True).shape[1]
+
+            self.transform_type = config.get('transform_type', 'quadratic_form')
+            self.non_symmetric_L = self.transform_type == 'quadratic_form_non_symmetric_L'
 
         if self.config and self.config.get('sideinfo_dependent'):
             self.is_sidep = True
@@ -336,8 +379,8 @@ class CA_Calibrator(nn.Module):
             self.si_dim = si_dim
             if self.config.get('concat_durfeats_with_sideinfo'):
                 self.si_dim += numdurf
-            self.sidep_alpha = Quadratic(self.si_dim, use_G=use_G, use_C=use_C, use_L=use_L)
-            self.sidep_beta  = Quadratic(self.si_dim, use_G=use_G, use_C=use_C, use_L=use_L)
+            self.sidep_alpha = Quadratic(self.si_dim, use_G=use_G, use_C=use_C, use_L=use_L, non_symmetric_L=self.non_symmetric_L)
+            self.sidep_beta  = Quadratic(self.si_dim, use_G=use_G, use_C=use_C, use_L=use_L, non_symmetric_L=self.non_symmetric_L)
 
         if self.config and self.config.get('duration_dependent'):
             self.is_durdep = True
@@ -345,8 +388,8 @@ class CA_Calibrator(nn.Module):
             use_G = config.get("use_G_for_dur", True) 
             use_L = config.get("use_L_for_dur", True) 
             use_C = config.get("use_C_for_dur", True) 
-            self.durdep_alpha = Quadratic(numdurf, use_G=use_G, use_C=use_C, use_L=use_L)
-            self.durdep_beta  = Quadratic(numdurf, use_G=use_G, use_C=use_C, use_L=use_L)
+            self.durdep_alpha = Quadratic(numdurf, use_G=use_G, use_C=use_C, use_L=use_L, non_symmetric_L=self.non_symmetric_L)
+            self.durdep_beta  = Quadratic(numdurf, use_G=use_G, use_C=use_C, use_L=use_L, non_symmetric_L=self.non_symmetric_L)
         
         if not self.is_sidep and not self.is_durdep:
             # Global calibration
@@ -439,7 +482,7 @@ class CA_Calibrator(nn.Module):
                 side_info_test   = torch.cat([durs_test,   side_info_test],   1) 
             alpha_si = self.sidep_alpha.score(side_info_test, side_info_enroll)
             beta_si  = self.sidep_beta.score(side_info_test, side_info_enroll)
-            if self.si_cal_first:
+            if self.si_cal_first:                
                 scores = alpha_si*scores + beta_si
 
         if self.is_durdep:
@@ -514,12 +557,13 @@ class CA_Calibrator(nn.Module):
 class Quadratic(nn.Module):
     """ Note that, while I am calling this class Quadratic, it is actually a
     second order polynomial on the inputs rather than just quadratic"""
-    def __init__(self, in_dim, use_G=True, use_C=True, use_L=True):
+    def __init__(self, in_dim, use_G=True, use_C=True, use_L=True, non_symmetric_L=False):
         super().__init__()
         self.L = Parameter(torch.zeros(in_dim, in_dim)) if use_L else None
         self.G = Parameter(torch.zeros(in_dim, in_dim)) if use_G else None
         self.C = Parameter(torch.zeros(in_dim, 1)) if use_C else None
         self.k = Parameter(torch.tensor(0.0))
+        self.non_symmetric_L = non_symmetric_L
 
     def forward(self, x):
         # The forward method assumes the same enroll and test data. This is used in training.
@@ -535,7 +579,8 @@ class Quadratic(nn.Module):
             symmetric = False
 
         if self.L is not None:
-            Lterm = torch.matmul(torch.matmul(xe, 0.5*(self.L+self.L.T)), xt.T)
+            L = self.L if self.non_symmetric_L else 0.5*(self.L+self.L.T)
+            Lterm = torch.matmul(torch.matmul(xe, L), xt.T)
         else:   
             Lterm = torch.zeros(xe.shape[0],xt.shape[0]) 
         
@@ -557,6 +602,11 @@ class Quadratic(nn.Module):
 
         return output
 
+    def score_with_stats(self, xt, estats):
+        # In this form we cannot do proper PLDA scoring because we loose the covariance matrices.
+        # Hence, we simply represent the embeddings from each sample by their mean.
+        xe = estats.M.T
+        return self.score(xt, xe)
 
     def init_with_constant(self, k, std_for_mats=0):
         # Initialize k with a given value and, optionally, the 
@@ -571,7 +621,7 @@ class Quadratic(nn.Module):
         nn.init.normal_(self.G, 0.0, std)
         nn.init.normal_(self.C, 0.0, std)
 
-    def init_with_plda(self, x, speaker_ids, init_params, domain_ids=None):
+    def init_with_plda_trained_generatively(self, x, speaker_ids, init_params, domain_ids=None):
         # Compute a PLDA model with the input data, approximating the 
         # model with just the usual initialization without the EM iterations
 
@@ -634,6 +684,64 @@ class Quadratic(nn.Module):
         state_dict = {'L': L, 'G': G, 'C': C, 'k': k.squeeze()}
 
         utils.replace_state_dict(self, state_dict)
+
+
+
+class HTPLDA(nn.Module):
+
+    def __init__(self, in_dim, rank):
+        super().__init__()
+        self.F = Parameter(torch.zeros(in_dim, rank)) 
+        self.H = Parameter(torch.zeros(in_dim, in_dim))
+        self.mu = Parameter(torch.zeros(in_dim,1))
+        self.nu = Parameter(torch.tensor(1.0))
+        self.rank = rank
+
+    def forward(self, x):
+        # The forward method assumes the same enroll and test data. This is used in training.
+        return self.score(x)
+
+    def score(self, xt, xe=None):
+ 
+        if xe is None:
+            xe = xt
+        
+        xem = xe-self.mu.T
+        xtm = xt-self.mu.T
+
+        return htplda.score_matrix(self.H, self.F, self.nu, xem.T, xtm.T)
+
+    def score_with_stats(self, xt, estats):
+
+        Me  = estats.M.T - self.mu.T
+        Ne  = estats.N
+        xtm = xt - self.mu.T
+
+        return htplda.score_matrix_with_stats(self.H, self.F, self.nu, Me.T, xtm.T, Ne)
+
+
+    def init_with_plda_trained_generatively(self, x, speaker_ids, init_params, domain_ids=None):
+        # Compute a PLDA model with the input data, approximating the 
+        # model with just the usual initialization without the EM iterations
+
+        if init_params.get('balance_by_domain'):
+            raise Exception("Balance by domain not implemented for HT-PLDA initialization")
+
+        #weights = compute_weights(speaker_ids, domain_ids, init_params.get('balance_by_domain'))
+        #class_weights = weights['speaker_weights']
+        class_weights = None
+        nu = init_params.get('htplda_nu', 10000)
+
+        mu, F, Cw = compute_ht_plda_model(x, speaker_ids, self.rank, nu, class_weights, niters=5, quiet=False)
+
+        L = np.linalg.cholesky(Cw)
+        I = np.identity(Cw.shape[0])
+        H = linalg.solve_triangular(L, I, trans='T', lower=True)
+            
+        state_dict = {'F': F, 'H': H, 'mu': mu[:,np.newaxis], 'nu': nu}
+
+        utils.replace_state_dict(self, state_dict)
+
 
 
 
@@ -735,6 +843,29 @@ class Affine(nn.Module):
         utils.replace_state_dict(self, {'W': np.c_[Wl].T})
 
 
+class Stats(nn.Module):
+    def __init__(self, in_dim, num_classes):
+        # Store 1st and 0th order stats from data
+        super().__init__()
+        self.M = Parameter(torch.zeros(in_dim, num_classes))
+        self.N = Parameter(torch.zeros(num_classes))
+      
+    def init_with_data(self, data, speaker_ids, domain_ids, enrollment_classes, idx_to_str, init_params):
+
+        # idx_to_str['speaker_id_inv'] contains a mapping from string to indices corresponding to the speaker_ids array
+        weights = compute_weights(speaker_ids, domain_ids, init_params.get('balance_by_domain'))['sample_weights'][:,np.newaxis]
+        speaker_ids_onehot = utils.onehot_for_class_ids(speaker_ids, enrollment_classes, idx_to_str['speaker_id_inv'])
+        weights = speaker_ids_onehot * weights
+        counts = np.sum(weights,axis=0)
+        means = data.T @ weights / counts
+
+        if init_params.get('fix_enrollment_counts_to_one'):
+            # Used for comparing the effect of taking into account the counts
+            counts = np.ones_like(counts)
+
+        utils.replace_state_dict(self, {'M': means, 'N': counts})
+
+
 class SimpleNN(nn.Module):
 
     def __init__(self, in_dim, out_dim, out_activation, inner_sizes, inner_activation):
@@ -761,123 +892,6 @@ class SimpleNN(nn.Module):
             layer.init_random(W_param, b_param, init_type)
 
         self.outlayer.init_random(W_param, b_param, init_type)
-
-
-
-def compute_2cov_plda_model(x, class_ids, class_weights, em_its=0, init_ids=None):
-    """ Follows the "EM for SPLDA" document from Niko Brummer:
-    https://sites.google.com/site/nikobrummer/EMforSPLDA.pdf
-    """
-
-    if init_ids is None:
-        init_ids = class_ids
-
-    BCov, WCov, GCov, mu, muc, stats = compute_lda_model(x, init_ids, class_weights)
-    W = utils.CholInv(WCov)
-    v, e = linalg.eig(BCov)
-    V = e * np.sqrt(np.real(v))
-    
-    def mstep(R, T, S, n_samples):
-        V = (utils.CholInv(R) @  T).T
-        Winv = 1/n_samples * (S-V@T)
-        W = utils.CholInv(Winv)
-        return V, W, Winv
-
-    def estep(stats, V, W):
-        VtW  = (W @ V).T
-        VtWV = VtW @ V
-        VtWf = VtW @ stats.F.T
-        y_hat = np.zeros_like(stats.F).T
-        R = np.zeros_like(V)
-        llk = 0.0
-        for n in np.unique(stats.N):
-            idxs = np.where(stats.N == n)[0]
-            L = n * VtWV + np.eye(V.shape[0])
-            Linv = utils.CholInv(L)
-            y_hat[:,idxs] = Linv @ VtWf[:,idxs]
-            # The expression below is a robust way for solving 
-            # yy_sum = len(idxs)*Linv + np.dot(y_hat[:, idxs], y_hat[:, idxs].T)
-            # while avoiding doing the inverse of L which can create numerical issues
-            n_spkrs = np.sum(stats.cweights[idxs])
-            yy_sum = np.linalg.solve(L, n_spkrs * np.eye(V.shape[0]) + L @ y_hat[:, idxs] @ (y_hat[:, idxs].T * stats.cweights[idxs]))
-            R += n*yy_sum
-            llk += 0.5 * n_spkrs * Linv.logdet()
-        T = y_hat @ (stats.F * stats.cweights)
-        llk += 0.5*np.trace(T @ VtW.T) + 0.5 * np.sum(stats.N*stats.cweights) * W.logdet() - 0.5 * np.trace(W @ stats.S)
-        return R, T, llk/np.sum(stats.N*stats.cweights)
-
-    prev_llk = 0.0
-    for it in range(em_its):
-        R, T, llk = estep(stats, V, W)
-        V, W, WCov = mstep(R, T, stats.S, np.sum(stats.N*stats.cweights))
-        print("EM it %d LLK = %.5f (+%.5f)" % (it, llk, llk-prev_llk))
-        prev_llk = llk 
-    
-    BCov = V @ V.T
-
-    return BCov, WCov, np.atleast_2d(mu)
-
-def compute_stats(x, class_ids, class_weights, sample_weights):
-    # Zeroth, first and second order stats per speaker, considering that
-    # each speaker is weighted by the provided weights
-    
-    stats     = utils.AttrDict(dict())
-    nsamples  = class_ids.shape[0]
-    classmat  = coo_matrix((np.ones(nsamples), (class_ids, np.arange(nsamples)))).tocsr()
-    stats.cweights = np.atleast_2d(class_weights).T
-    stats.sweights = np.atleast_2d(sample_weights).T / np.sum(sample_weights) * float(nsamples)
-    sweightsdiag   = dia_matrix((stats.sweights.squeeze(),0),shape=(nsamples,nsamples))
-    classmat_sw    = classmat.dot(sweightsdiag) # Matrix with one row per speaker and one col per sample, with the weights as entries
-
-    # Global mean, considering that each speaker's data should be 
-    # multiplied by the corresponding weight for that speaker
-    sample_weights = stats.cweights[class_ids] * stats.sweights
-    stats.mu       = np.array(sample_weights.T @ x) / np.sum(sample_weights) 
-
-    # N and F are stats per speaker, weights are not involved in the computation of those. 
-    # S, on the other hand, is already a sum over speakers so the sample from each speaker
-    # has to be weighted by the corresponding weight
-    xcent     = x - stats.mu
-    xcentw    = xcent * sample_weights
-    stats.N   = np.array(classmat_sw.sum(1)) 
-    stats.F   = np.array(classmat_sw @ xcent)
-    stats.S   = xcent.T @ xcentw
-
-    return stats
-
-
-def compute_lda_model(x, class_ids, weights):
-
-    class_weights = weights['speaker_weights']
-    sample_weights = weights['sample_weights']
-
-    # Simpler code using sklearn. We are not using this because it does not allow for weights
-    # lda = discriminant_analysis.LinearDiscriminantAnalysis(store_covariance=True)
-    # lda.fit(x, class_ids)
-    # WCov = lda.covariance_
-    # BCov = np.cov(x.T, bias=1) - WCov
-    # mu = np.mean(x, axis=0)
-    # GCov should be the same as np.cov(x.T,  bias=1)
-
-    stats = compute_stats(x, class_ids, class_weights, sample_weights)
-
-    # Once we have the stats, we do not need x or class_ids any more (we still do need the class weights)
-    mu    = stats.mu
-    muc   = stats.F / stats.N + stats.mu # Means by class (not centered)
-    
-    # Matrix with the weights per speaker in the diagonal
-    n_spkrs = stats.N.shape[0]
-    weightsdia = dia_matrix((class_weights,0),shape=(n_spkrs, n_spkrs))
-
-    # BCov and GCov are computed by weighting the contribution of each speaker with 
-    # the provided weights
-    Ntot  = np.sum(np.multiply(stats.N, stats.cweights))
-    Fs    = stats.F / np.sqrt(stats.N) 
-    BCov  = Fs.T @ (Fs * stats.cweights) / Ntot
-    GCov  = stats.S / Ntot
-    WCov  = GCov - BCov
-
-    return BCov, WCov, GCov, mu.squeeze(), muc, stats
 
 
 
