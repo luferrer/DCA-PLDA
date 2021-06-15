@@ -14,7 +14,7 @@ We have found this system to provide great out-of-the-box performance across a v
 
 The code can also be used to train and evaluate a standard PLDA pipeline. Basically, the initial model before any training epochs is identical to a PLDA system, with an option for weighting the samples during training to compensate for imbalance across training domains.
 
-This code was written by Luciana Ferrer. The pre-computed embeddings provided to run the example were computed using SRI's software and infrastructure. We thank Niko Brummer for his help with the calibration code in the calibration.py file.
+This code was written by Luciana Ferrer. We thank Niko Brummer for his help with the calibration code in the calibration.py file and for providing the code to do heavy-tail PLDA. The pre-computed embeddings provided to run the example were computed using SRI's software and infrastructure.
 
 We will appreciate any feedback about the code or the approaches. Also, please let us know if you find bugs.
 
