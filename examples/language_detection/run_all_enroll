@@ -1,0 +1,82 @@
+#!/bin/bash -e
+#
+# Same as run_all, but training on a subset of the training data after
+# discarding 5 languages. Then, all the training data (including the
+# subset) is used to replace the enrollment means of the model,
+# keeping all other parameters frozen. This is meant to simulate a
+# scenario were you may want very rapid enrollment of new languages,
+# without the need for retraining the model.
+#
+# Note that for reenrollment to make sense, the model has to be trained
+# with some parameters frozen (see the stage1_frzenroll config)
+#
+# Results from this script show that results after reenrollment are
+# significantly worse than when training from scratch using the new
+# data (compare with results from run_all). This is partly due to: (1)
+# the smaller lda dimension (since fewer training languages are
+# available when training the model), (2) the frozen parameters, and
+# (3) the PLDA model not having been exposed to those new languages.
+#
+# After fine-tuning with the new data, (3) is solved, but (1) and (2)
+# are not. We recommend to train the model from scratch if at all
+# possible to get the best possible performance.
+
+
+# CPU or GPU number, if GPU is available
+device=0
+seed=0
+
+# Sets used to choose the best model from the second stage
+dev_sets="heldout_voxlin" 
+
+trndata_full=voxlin
+trndata=${trndata_full}_minus5lan
+
+conf_trn=configs/train/stage1_frzenroll.ini
+    
+out_dir_trn=output/train_${trndata}_frzenroll
+out_dir_enr=output/train_${trndata}_frzenroll_reenroll_${trndata_full}
+mkdir -p $out_dir_trn $out_dir_enr
+
+# Create the list of languages and cluster for this training data
+
+cut -d ' ' -f 2 data/train/metadata_$trndata      | sort -u > $out_dir_trn/languages
+cut -d ' ' -f 2 data/train/metadata_$trndata_full | sort -u > $out_dir_enr/languages
+sort data/train/clusters | join - $out_dir_trn/languages  > $out_dir_trn/clusters
+sort data/train/clusters | join - $out_dir_enr/languages  > $out_dir_enr/clusters
+
+for archn in dplda_lda83 hdplda_lda64+19; do
+
+    conf=configs/arch/$archn.ini
+
+    # Add the enrollment list to the config
+    cp $conf $out_dir_trn/$archn.ini
+    cp $conf $out_dir_enr/$archn.ini
+    echo "fixed_enrollment_ids = '$out_dir_trn/clusters'" >> $out_dir_trn/$archn.ini
+    echo "fixed_enrollment_ids = '$out_dir_enr/clusters'" >> $out_dir_enr/$archn.ini
+	
+    # Train the models using a subset of the training data    
+    ./run_expt -d "$dev_sets" -o $out_dir_trn/$archn/seed$seed -a $out_dir_trn/$archn.ini -D $device -s $seed -t $trndata -T $conf_trn
+    
+    # Now, create new models, replacing the enrollment parameters 
+    # this time using all the training data, and then fine-tune.
+    init_model=`ls $out_dir_trn/$archn/seed$seed/stage2/models/last*.pth`
+    ./run_expt -d "$dev_sets" -o $out_dir_enr/$archn/seed$seed -a $out_dir_enr/$archn.ini -D $device -s $seed -t $trndata_full -T $conf_trn -I $init_model
+
+done    
+    
+# Summarized results showing only actual Cllr and grouped by set rather than my model for ease of comparison
+# For full results with all metrics, look at the all_results files below
+dur=32
+printf "%-30s %-15s %-15s %-15s\n" "Set" "System" "Min-Cllr" "Actual-Cllr" > tmp$$
+./format_results $dur $out_dir_enr/dplda_lda83/seed$seed/stage1/eval_ep0000/all_results "1.DPLDA"    >> tmp$$
+./format_results $dur $out_dir_enr/dplda_lda83/seed$seed/stage1/eval_best/all_results   "2.DPLDA.FT1" >> tmp$$
+./format_results $dur $out_dir_enr/dplda_lda83/seed$seed/stage2/eval_best/all_results   "3.DPLDA.FT2" >> tmp$$
+
+echo "Results on 32-second chunks"
+echo ""
+head -1 tmp$$
+tail +2 tmp$$ | sort | gawk '{if($1!=prev) print ""; prev=$1; print}'
+rm tmp$$
+
+

@@ -1,0 +1,80 @@
+#!/bin/bash -e
+#
+# Run two different backends, with different architectures
+#
+# * D-PLDA: PLDA form trained discriminatively
+#
+# * HD-PLDA: Hierarchical version of D-PLDA
+#
+# Results from this script can be found in the following files
+#
+# output/train*/*/seed*/stage*/eval_best/all_results
+#
+# The results include counts, EER, Cllr and DCF metrics. Cllr and DCF
+# are computed with two different ptar values. Also, we compute the
+# actual value as well as the min value for each case. The min values
+# for the Cllr metrics are computed in two different ways: by doing a
+# cheating linear logistic regression on the test data itself (the
+# ones called "LIN") and by using the PAV algorithm on the test data
+# (called "PAV"). The PAV estimates are slightly lower since that
+# model is non-parametric and can adapt more to the test data, which
+# might result in overfitting.
+#
+# Training is run in two stages, to allow for different training
+# parameters in each stage.  The model from the first iteration in
+# stage 1 correspond to a standard a PLDA backend. Scoring is done
+# by the usual approximation where all samples from each enrollment
+# model (a language's training data in this case) are averaged to
+# create a single vector. Note that, for PLDA, the proper scoring
+# approach gives better results. This repository does not yet
+# implement proper scoring.
+#
+# Results from this script show that:
+#
+# * Simple Discriminative PLDA gives better results than PLDA
+# * The hierachical approach helps on unseen conditions 
+
+
+# CPU or GPU number, if GPU is available
+device=0
+seed=0
+
+# Sets used to choose the best model from the second stage
+dev_sets="heldout_voxlin" 
+
+trndata=voxlin
+
+out_dir=output/train_${trndata}
+mkdir -p $out_dir
+
+# Create the list of languages and cluster for this training data
+cut -d ' ' -f 2 data/train/metadata_$trndata  | sort -u > $out_dir/languages
+sort data/train/clusters | join - $out_dir/languages  > $out_dir/clusters
+
+for archn in dplda_lda88 hdplda_lda65+22; do
+
+    conf=configs/arch/$archn.ini
+	
+    # Add the enrollment list to the config
+    cp $conf $out_dir/$archn.ini
+    echo "fixed_enrollment_ids = '$out_dir/clusters'" >> $out_dir/$archn.ini
+    
+    ./run_expt -d "$dev_sets" -o $out_dir/$archn/seed$seed -a $out_dir/$archn.ini -D $device -s $seed -t $trndata
+	
+done
+
+# Summarized results showing only actual Cllr and grouped by set rather than by model for ease of comparison
+# For full results with all metrics, look at the all_results files below
+dur=32
+printf "%-30s %-15s %-15s %-15s\n" "Set" "System" "Min-Cllr" "Actual-Cllr" > tmp$$
+./format_results $dur $out_dir/dplda_lda88/seed$seed/stage1/eval_ep0000/all_results    "1.PLDA"   >> tmp$$
+./format_results $dur $out_dir/dplda_lda88/seed$seed/stage2/eval_best/all_results      "2.DPLDA"  >> tmp$$
+./format_results $dur $out_dir/hdplda_lda65+22/seed$seed/stage2/eval_best/all_results  "3.HDPLDA" >> tmp$$
+
+echo "Results on 32-second chunks"
+echo ""
+head -1 tmp$$
+tail +2 tmp$$ | sort | gawk '{if($1!=prev) print ""; prev=$1; print}'
+rm tmp$$
+
+
