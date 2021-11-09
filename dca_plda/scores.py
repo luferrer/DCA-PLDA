@@ -5,11 +5,9 @@ Code based on the sitw scorer code by Mitch McLaren, with some additions and cha
 import sys, os, re, gzip, h5py
 import numpy as np
 import gzip
-import utils
 from scipy.optimize import minimize
 from scipy.special import logit
-from calibration import logregCal, cross_entropy, PAV, ROCCH, softplus
-from IPython import embed
+from dca_plda import calibration, utils
 
 class Key(object):
     """
@@ -98,11 +96,14 @@ class Key(object):
                         v = 1 if vs == "tgt" else -1
                         mask[idxenrollids[e], idxtestids[t]] = v
             else:
-                # All trials are valid in this case. The mask is -1 except for
-                # the language corresponding to the sample.
-                mask = -np.ones((nbT, nbt),dtype=np.int8)
+                # default mask is 0, for those test files that do not
+                # appear in the key, it stays 0
+                mask = np.zeros((nbT, nbt),dtype=np.int8)
                 for t, e in lines:
                     if e in idxenrollids and t in idxtestids:
+                        # for the test files that do appear in the key, set
+                        # the mask to -1 except for the true language
+                        mask[:, idxtestids[t]] = -1
                         mask[idxenrollids[e], idxtestids[t]] = 1
 
         return Key(enrollids, testids, mask)
@@ -244,7 +245,7 @@ class IdMap(object):
         return idmap
 
 
-def compute_performance(scores, keylist, outfile, ptar=0.01, setname=None):
+def compute_performance(scores, keylist, outfile, ptar=0.01, setname=None, enrollment_ids=None):
     """
     Print to screen the average R-Precision over enrolled models
     """
@@ -256,13 +257,16 @@ def compute_performance(scores, keylist, outfile, ptar=0.01, setname=None):
     outf.write("%-32s | #TGT(#missing) #IMP(#missing) |    EER   |   ACLLR MCLLR_LIN MCLLR_PAV |   ACLLR MCLLR_LIN MCLLR_PAV |  ADCF    MDCF   |   ADCF   MDCF  \n"%"Key")
 
     for keyf in [l.strip() for l in open(keylist).readlines()]:
-        key  = Key.load(keyf)
+
+        key  = Key.load(keyf, enrollids=enrollment_ids)
         name = re.sub('.h5$', '', os.path.basename(keyf))
         if setname is not None:
             name="%s:%s"%(setname,name)
 
         ascores = scores.align(key)
-        det = Det(ascores, key, pav=True)
+        tar = ascores.score_mat[key.mask==1]
+        non = ascores.score_mat[key.mask==-1]
+        det = Det(tar, non, pav=True)
 
         missing_tar = np.sum((key.mask==1)*ascores.missing)
         missing_non = np.sum((key.mask==-1)*ascores.missing)
@@ -286,12 +290,10 @@ def compute_performance(scores, keylist, outfile, ptar=0.01, setname=None):
 
 class Det(object):
     """
-    Class to compute different metrics given a Score and a Key object
+    Class to compute different metrics given vectors of target (tar) and impostor (non) scores.
     """
-    def __init__(self, scores, key, pav=False):
-
-        tar    = scores.score_mat[key.mask==1]
-        non    = scores.score_mat[key.mask==-1]
+    def __init__(self, tar, non, pav=False):
+        
         ntrue  = tar.shape[0]
         nfalse = non.shape[0]
         ntotal = ntrue+nfalse
@@ -328,7 +330,7 @@ class Det(object):
             sc = np.concatenate((tar,non))
             la = np.zeros_like(sc,dtype=int)
             la[:len(tar)] = 1.0
-            self.pav = PAV(sc, la)
+            self.pav = calibration.PAV(sc, la)
         else:
             self.pav = None
 
@@ -343,7 +345,7 @@ class Det(object):
         if from_rocch:
             if self.pav is None:
                 raise Exception("To extract eer from ROC convex hull you need to call DET with pav=True")
-            return ROCCH(self.pav).EER()
+            return calibration.ROCCH(self.pav).EER()
 
         else:
             idxeer=np.argmin(np.abs(self.Pfa-self.Pmiss))
@@ -400,7 +402,7 @@ class Det(object):
         """
         cllrs = []
         for p in np.atleast_1d(ptar):
-            cllrs.append(cross_entropy(self.tar, self.non, p))
+            cllrs.append(calibration.cross_entropy(self.tar, self.non, p))
 
         return np.array(cllrs).squeeze()
 
@@ -418,7 +420,7 @@ class Det(object):
 
                 logitPost = llrs + logit(p)
 
-                Ctar, Cnon = softplus(-logitPost), softplus(logitPost)
+                Ctar, Cnon = calibration.softplus(-logitPost), calibration.softplus(logitPost)
                 min_cllr = p*(Ctar[ntar!=0] @ ntar[ntar!=0]) / ntar.sum() +  (1-p)*(Cnon[nnon!=0] @ nnon[nnon!=0]) / nnon.sum()  
                 min_cllr /= -p*np.log(p) - (1-p)*np.log(1-p)
 
@@ -426,9 +428,9 @@ class Det(object):
         else:
 
             for p in np.atleast_1d(ptar):
-                cal = logregCal(self.tar, self.non, p)
+                cal = calibration.logregCal(self.tar, self.non, p)
                 tar_cal, non_cal = cal(self.tar), cal(self.non)
-                cllrs.append(cross_entropy(tar_cal, non_cal, p))
+                cllrs.append(calibration.cross_entropy(tar_cal, non_cal, p))
 
         return np.array(cllrs).squeeze()
 
@@ -450,7 +452,4 @@ def create_aligned_mask(orig_mask, target_enroll, target_test, orig_enroll, orig
     missing[np.ix_(hase, hast)] = 0
 
     return mask, hase, hast, missing
-
-
-
 
