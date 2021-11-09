@@ -4,36 +4,36 @@ import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
 import numpy as np
-from IPython import embed
 from sklearn import discriminant_analysis
 from scipy.special import logit
 from scipy.sparse import coo_matrix, dia_matrix
-import utils 
-import data as ddata 
-import calibration
 from scipy import linalg
 from numpy.linalg import eigh, solve
 from scipy.special import gammaln, psi
 from numpy.random import randn
 
+from dca_plda import utils 
+from dca_plda import data as ddata 
+from dca_plda import calibration
+
 def compute_ht_plda_model(X, labels, rank, nu, class_weights, niters=0, quiet=False):
     """ 
     Trains an HTPLDA model, from a database (matrix) of x-vectors, 
-    labelled wrt speaker. A VBEM algorithm is used.
+    labelled wrt class. A VBEM algorithm is used.
     
     The model parameter, mu is initialized to the data mean and is then further 
     trained along with the other parameters, using VBEM. 
     
     Inputs:
         X: (dim,n)  data in columns (MATLAB style)
-        labels: (n,) integer speaker labels
-        rank: integer , 1 <= rank < dim,  speaker subspace dimension
+        labels: (n,) integer class labels
+        rank: integer , 1 <= rank < dim,  class subspace dimension
         nu: degrees of freedom, nu>0  
         niters: number of EM iterations to run
     Outputs: (model parameters and training objective)
         
         mu: (dim,)      x-vector mean
-        F:  (dim,rank)  speaker factor loading matrix
+        F:  (dim,rank)  class factor loading matrix
         Cw: (dim,dim)   within-class covariance
         
         obj: (niters, ) training objective
@@ -60,7 +60,7 @@ def compute_ht_plda_model(X, labels, rank, nu, class_weights, niters=0, quiet=Fa
 
 
 
-def compute_2cov_plda_model(x, class_ids, class_weights, em_its=0, init_ids=None):
+def compute_2cov_plda_model(x, class_ids, weights, em_its=0, init_ids=None):
     """ Follows the "EM for SPLDA" document from Niko Brummer:
     https://sites.google.com/site/nikobrummer/EMforSPLDA.pdf
     """
@@ -68,7 +68,7 @@ def compute_2cov_plda_model(x, class_ids, class_weights, em_its=0, init_ids=None
     if init_ids is None:
         init_ids = class_ids
 
-    BCov, WCov, GCov, mu, muc, stats = compute_lda_model(x, init_ids, class_weights)
+    BCov, WCov, GCov, mu, muc, stats = compute_lda_model(x, init_ids, weights)
     W = utils.CholInv(WCov)
     v, e = linalg.eig(BCov)
     V = e * np.sqrt(np.real(v))
@@ -94,10 +94,10 @@ def compute_2cov_plda_model(x, class_ids, class_weights, em_its=0, init_ids=None
             # The expression below is a robust way for solving 
             # yy_sum = len(idxs)*Linv + np.dot(y_hat[:, idxs], y_hat[:, idxs].T)
             # while avoiding doing the inverse of L which can create numerical issues
-            n_spkrs = np.sum(stats.cweights[idxs])
-            yy_sum = np.linalg.solve(L, n_spkrs * np.eye(V.shape[0]) + L @ y_hat[:, idxs] @ (y_hat[:, idxs].T * stats.cweights[idxs]))
+            n_classes = np.sum(stats.cweights[idxs])
+            yy_sum = np.linalg.solve(L, n_classes * np.eye(V.shape[0]) + L @ y_hat[:, idxs] @ (y_hat[:, idxs].T * stats.cweights[idxs]))
             R += n*yy_sum
-            llk += 0.5 * n_spkrs * Linv.logdet()
+            llk += 0.5 * n_classes * Linv.logdet()
         T = y_hat @ (stats.F * stats.cweights)
         llk += 0.5*np.trace(T @ VtW.T) + 0.5 * np.sum(stats.N*stats.cweights) * W.logdet() - 0.5 * np.trace(W @ stats.S)
         return R, T, llk/np.sum(stats.N*stats.cweights)
@@ -114,8 +114,8 @@ def compute_2cov_plda_model(x, class_ids, class_weights, em_its=0, init_ids=None
     return BCov, WCov, np.atleast_2d(mu)
 
 def compute_stats(x, class_ids, class_weights, sample_weights):
-    # Zeroth, first and second order stats per speaker, considering that
-    # each speaker is weighted by the provided weights
+    # Zeroth, first and second order stats per class, considering that
+    # each class is weighted by the provided weights
     
     stats     = utils.AttrDict(dict())
     nsamples  = class_ids.shape[0]
@@ -123,15 +123,15 @@ def compute_stats(x, class_ids, class_weights, sample_weights):
     stats.cweights = np.atleast_2d(class_weights).T
     stats.sweights = np.atleast_2d(sample_weights).T / np.sum(sample_weights) * float(nsamples)
     sweightsdiag   = dia_matrix((stats.sweights.squeeze(),0),shape=(nsamples,nsamples))
-    classmat_sw    = classmat.dot(sweightsdiag) # Matrix with one row per speaker and one col per sample, with the weights as entries
+    classmat_sw    = classmat.dot(sweightsdiag) # Matrix with one row per class and one col per sample, with the weights as entries
 
-    # Global mean, considering that each speaker's data should be 
-    # multiplied by the corresponding weight for that speaker
+    # Global mean, considering that each class's data should be 
+    # multiplied by the corresponding weight for that class
     sample_weights = stats.cweights[class_ids] * stats.sweights
     stats.mu       = np.array(sample_weights.T @ x) / np.sum(sample_weights) 
 
-    # N and F are stats per speaker, weights are not involved in the computation of those. 
-    # S, on the other hand, is already a sum over speakers so the sample from each speaker
+    # N and F are stats per class, weights are not involved in the computation of those. 
+    # S, on the other hand, is already a sum over classes so the sample from each class
     # has to be weighted by the corresponding weight
     xcent     = x - stats.mu
     xcentw    = xcent * sample_weights
@@ -144,7 +144,7 @@ def compute_stats(x, class_ids, class_weights, sample_weights):
 
 def compute_lda_model(x, class_ids, weights):
 
-    class_weights = weights['speaker_weights']
+    class_weights  = weights['class_weights']
     sample_weights = weights['sample_weights']
 
     # Simpler code using sklearn. We are not using this because it does not allow for weights
@@ -161,11 +161,11 @@ def compute_lda_model(x, class_ids, weights):
     mu    = stats.mu
     muc   = stats.F / stats.N + stats.mu # Means by class (not centered)
     
-    # Matrix with the weights per speaker in the diagonal
-    n_spkrs = stats.N.shape[0]
-    weightsdia = dia_matrix((class_weights,0),shape=(n_spkrs, n_spkrs))
+    # Matrix with the weights per class in the diagonal
+    n_classes = stats.N.shape[0]
+    weightsdia = dia_matrix((class_weights,0),shape=(n_classes, n_classes))
 
-    # BCov and GCov are computed by weighting the contribution of each speaker with 
+    # BCov and GCov are computed by weighting the contribution of each class with 
     # the provided weights
     Ntot  = np.sum(np.multiply(stats.N, stats.cweights))
     Fs    = stats.F / np.sqrt(stats.N) 
@@ -246,9 +246,9 @@ def iteration_mu(mu,nu,F,Cw,X0,labels,quiet=False):
     Inputs:
        nu: scalar, df > 0 (nu=inf is allowed: it signals Gaussian PLDA)
        F: (D,d) factor loading matrix, D > d
-       Cw: within-speaker covariance, (D,D), pos. def,
+       Cw: within-class covariance, (D,D), pos. def,
        X0: (D,N) data matrix (not centered)
-       labels: (M,N), one hot columns, labels for M speakers and N x-vectors
+       labels: (M,N), one hot columns, labels for M classes and N x-vectors
                This is a large matrix and it is best represented in sparse format
     
     Returns:
