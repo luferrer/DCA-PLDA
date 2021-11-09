@@ -2,30 +2,33 @@ import random
 import torch
 from torch.utils.data import Dataset
 import numpy as np
-from IPython import embed
-import utils 
 import h5py
+from dca_plda import utils
+from numpy.lib import recfunctions as rfn
 
-class SpeakerDataset(Dataset):
+class LabelledDataset(Dataset):
     """Face Landmarks dataset."""
 
-    def __init__(self, emb_file, meta_file=None, meta_is_dur_only=False, device=None):
+    def __init__(self, emb_file, meta_file=None, meta_is_dur_only=False, device=None, cluster_ids=None):
         """
         Args:
             emb_file (string):  File with embeddings and sample ids in npz format
             meta_file (string): File with metadata for each id we want to store from the file above. 
-                                Should contain: sample_id speaker_id session_id domain_id
-                                *  The speaker id is a unique string identifying the speaker
+                                Should contain: sample_id class_id session_id domain_id [cluster_id]
+                                *  The class id is a unique string identifying the class of the sample (speaker, 
+                                   language, etc)
                                 *  The session id is a unique string identifying the recording session from which
                                    the audio sample was extracted (ie, if a waveform is split into chunks as a pre-
                                    processing step, the chunks all belong to the same session, or if several mics 
                                    were used to record a person speaking all these recordings belong to the same
                                    session). This information is used by the loader to avoid creating same-session
                                    trials which would mess up calibration.
-                                *  The domain id is a unique string identifying the domain. Domains should correspond 
-                                   to disjoint speaker sets. This information is also used by the loader. Only same-
-                                   domain trials are created since cross-domain trials would never include target 
-                                   trials and would likely result in very easy impostor trials.
+                                *  The domain id is a unique string identifying the domain of the sample. The domain
+                                   is assumed to be the dataset name. The domain id can be used to balance out
+                                   the samples per batch by domain. 
+                                   Further, only same-domain trials will be created since cross-domain trials would   
+                                   not include target trials and would likely result in very easy impostor trials.
+                                *  The cluster id is optional and only used for Hierarchical_DCA_PLDA.
         """
         if meta_file is not None:
             print("Loading data from %s\n  with metadata file %s"%(emb_file,meta_file))
@@ -40,6 +43,7 @@ class SpeakerDataset(Dataset):
         else:
             raise Exception("Unrecognized format for embeddings file %s"%emb_file)
 
+        print("  Done loading embeddings")
         embeddings_all = data_dict['data']
         if type(data_dict['ids'][0]) == np.bytes_:
             ids_all = [i.decode('UTF-8') for i in data_dict['ids']]
@@ -54,13 +58,19 @@ class SpeakerDataset(Dataset):
         if meta_file is None:
             fields = ('sample_id',)
             formats = ('O',)
-            self.meta_raw = np.array(ids_all, np.dtype({'names': fields, 'formats': ('O',)}))
+            self.meta_raw = np.array(ids_all, np.dtype({'names': fields, 'formats': formats}))
         else:
             if meta_is_dur_only:
                 fields, formats = zip(*[('sample_id', 'O'), ('duration', 'float32')])
             else:
-                fields, formats = zip(*[('sample_id', 'O'), ('speaker_id', 'O'), ('session_id', 'O'), ('domain_id', 'O'), ('duration', 'float32')])
+                fields, formats = zip(*[('sample_id', 'O'), ('class_id', 'O'), ('session_id', 'O'), ('domain_id', 'O'), ('duration', 'float32')])
             self.meta_raw = np.loadtxt(meta_file, np.dtype({'names': fields, 'formats': formats}))
+
+            if cluster_ids is not None:
+                cids = np.array([cluster_ids[c] for c in self.meta_raw['class_id']])
+                fields = fields + ('cluster_id',)
+                formats = formats + ('O',)
+                self.meta_raw = rfn.append_fields(self.meta_raw, '', cids, usemask=False).astype(np.dtype({'names': fields, 'formats': formats}))
         
         # Convert the metadata strings into indices
         print("  Converting metadata strings into indices")
@@ -108,15 +118,18 @@ class SpeakerDataset(Dataset):
             if np.sum(found) != len(subset):
                 print("Some of the files (%d) in the subset are missing. Ignoring them"%(len(subset)-np.sum(found)))
             indx = indx[found]
-
             # Subset the embeddings and the metadata to the required samples
             embeddings = self.embeddings[indx]
             meta = dict()
+            idx_to_str = dict()
             for k, v in self.meta.items():
-                meta[k] = v[indx]
+                id_map, meta[k] = utils.map_to_consecutive_ids(v[indx])
+                if k in self.idx_to_str:
+                    idx_to_str[k] = dict([(id_map[i],n) for i, n in self.idx_to_str[k].items() if i in id_map])
+                    idx_to_str[k+"_inv"] = dict([(n,i) for i, n in idx_to_str[k].items()])
             meta = utils.AttrDict(meta)
 
-            return embeddings, meta, self.idx_to_str
+            return embeddings, meta, idx_to_str
 
     def get_data(self):
         return self.embeddings
@@ -132,67 +145,103 @@ class SpeakerDataset(Dataset):
 
     def __getitem__(self, idx):
 
-        return {'emb': self.embeddings[idx].flatten(), 'speaker': self.meta_raw[idx]}
+        return {'emb': self.embeddings[idx].flatten(), 'class': self.meta_raw[idx]}
 
 
 
 class TrialLoader(object):
 
-    def __init__(self, dataset, device, batch_size=256, num_batches=10, balance_by_domain=True, seed=0, num_samples_per_spk=2, subset=None):
+    def __init__(self, dataset, metadata, metamaps, device, batch_size=256, num_batches=10, balance_method='same_num_classes_per_dom_then_same_num_samples_per_class', seed=0, num_samples_per_class=2, check_count_per_sess=True):
         """
         Args:
-            dataset: an object of class SpeakerDataset 
+            embeddings: list of embeddings, size NxD, where N is the number of samples and D is the embedding dimension
+            metadata: metadata dictionary for the embeddings (as generated by LabelledDataset.get_data_and_meta) above
+            metamaps: dictionary with the string names for each id in metadata (also generated by LabDataset.get_data_and_meta)
             device: device where to move the created batches
             batch_size: size of batches to create
             num_batches: number of batches to create
-            balance_by_domain: balance the batches by domain. If set to 'num_classes_per_dom_prop_to_its_total_num_classes', 
-            each class/domain pair will get the same number of samples per batch. Otherwise, if set to any other value except None or
-            False, it will generate the same number of samples per domain.
+            balance_method: which method to use for balancing the batches. There are four options, the first two are 
+                recommended for speaker verification data, the last two for language detection.
+                same_num_samples_per_class or none: each batch is composed of the same number of samples for each class
+                        The number of samples for each class is determined by num_samples_per_class.
+                same_num_classes_per_dom_then_same_num_samples_per_class: for each domain, the same number of classes
+                        appear in each batch. For each class, the same number of samples are selected (as indicated by
+                        num_samples_per_class)
+                same_num_samples_per_class_and_dom: each batch is composed of the same number of samples for each class
+                        and domain. Classes that appear in several domains, are overrepresented.
+                same_num_samples_per_class_then_same_num_samples_per_dom: each batch is composed of the same number of
+                        samples for each class, and within each class, each domain is represented by the same number of 
+                        samples.
             seed: seed for randomization of lists
-            num_samples_per_spk: minimum number of samples per speaker per batch. If the number of speakers is small, speakers
-            might repeat more than this number within each batch in order to fill in the batch.
+            num_samples_per_class: minimum number of samples per class per batch. If the available number of classes is small, classes
+               might repeat more than this number within each batch in order to fill in the batch.
             subset: subset of samples in dataset to use for batch generation
-            enrollment_samples_per_spk: list of number of samples to use to create models for each speaker. For example, if set to 
-            [1,1,3], an enrollment map will be created that includes, for each speaker, two models with one sample each and one model 
-            with three samples. Note that, in order to create a 3-sample model that can be tested against at least one unseen sample 
-            from that speaker, num_samples_per_spk has to be at least 4.
         """
+
         print("Initializing trial loader (this might take a while for big datasets but this process saves time during training).")
-        self.embeddings, self.metadata, self.metamaps = dataset.get_data_and_meta(subset=subset)
+        self.embeddings, self.metadata, self.metamaps = dataset, metadata, metamaps
         self.batch_size = batch_size
         self.num_batches = num_batches
         self.rng = np.random.RandomState(seed)
-        self.balance_by_domain = balance_by_domain
-        self.num_samples_per_spk = num_samples_per_spk
+        self.balance_method = balance_method
 
-        if batch_size%num_samples_per_spk != 0:
-            raise Exception("Batch size has to be a multiple of the number of samples per speaker requested (%d)"%num_samples_per_spk)
+        if balance_method not in ['none', 'same_num_samples_per_class_and_dom', 'same_num_samples_per_class_then_same_num_samples_per_dom', 'same_num_classes_per_dom_then_same_num_samples_per_class']:
+            raise Exception("Balance method %s not implemented"%balance_method)
 
-        if balance_by_domain:
-            dom_col = 'domain_id'
-        else:
+        if batch_size%num_samples_per_class != 0:
+            raise Exception("Batch size has to be a multiple of the number of samples per class requested (%d)"%num_samples_per_class)
+
+        if balance_method == 'same_num_samples_per_class' or balance_method == 'none':
             # Add a dummy domain column in self.metadata with all domains = 0 so that the
             # domain is ignored for trial selection
             dom_col = 'dummy_domain_id'
             self.metadata[dom_col] = np.zeros_like(self.metadata['domain_id'])
+            self.metamaps[dom_col] = {0: 'all'}
+        else:
+            # All other balancing methods use the domain information
+            dom_col = 'domain_id'
         
         # The following dictionaries are made to expedite the generation of batches
-        self.spkrs_for_dom,            self.spki    = self._init_index_and_list([dom_col], 'speaker_id')
-        self.sess_for_spk_dom,         self.sessi   = self._init_index_and_list(['speaker_id',dom_col], 'session_id', min_len=2)
-        self.samples_for_sess_spk_dom, self.samplei = self._init_index_and_list(['session_id','speaker_id',dom_col], 'sample_id')
+        self.classes_for_dom,            self.classi  = self._init_index_and_list([dom_col], 'class_id')
+        self.sessions_for_class_dom,     self.sessi   = self._init_index_and_list(['class_id',dom_col], 'session_id', min_len=2 if check_count_per_sess else 1)
+        self.samples_for_sess_class_dom, self.samplei = self._init_index_and_list(['session_id','class_id',dom_col], 'sample_id')
+        self.doms_for_classes,           self.domi    = self._init_index_and_list(['class_id'], dom_col)
 
-        self.domains = list(self.spki.keys())
-        
-        self.num_spkrs_per_dom = dict()
-        self.num_spkrs_per_batch = int(batch_size/num_samples_per_spk)
+        self.domains = list(self.classi.keys())
+        self.sel_num_classes_per_dom = dict()
+        self.sel_num_samples_per_class = dict()
         for dom in self.domains:
-            if balance_by_domain == 'num_classes_per_dom_prop_to_its_total_num_classes':
-                # In this case, each domain will have a number of samples that is proportional to
-                # the number of classes that domain has
-                self.num_spkrs_per_dom[dom] = int(np.ceil(len(self.spkrs_for_dom[dom]) * self.num_spkrs_per_batch / sum([len(s) for s in self.spkrs_for_dom.values()])))
+            dom_name = self.metamaps[dom_col][dom[0]]
+            if balance_method == 'same_num_samples_per_class_and_dom':
+                # In this case, each domain will have a number of selected classes proportional to
+                # the number of classes that domain has. 
+                nclasses = len(self.classes_for_dom[dom])
+                self.sel_num_classes_per_dom[dom] = nclasses * batch_size / len(self.sessions_for_class_dom)
+                # This is not used because the sel_num_classes_per_dom is in number of samples
+                self.sel_num_samples_per_class[dom] = 1
+                print("Selecting batches with %4d samples for domain %s divided equally for each of the %d classes (~ %.2f samples per class)"%
+                    (self.sel_num_classes_per_dom[dom], dom_name, nclasses, self.sel_num_classes_per_dom[dom] / nclasses))
+
+            elif balance_method == 'same_num_samples_per_class_then_same_num_samples_per_dom':
+                class_count = len(np.unique(np.concatenate(list(self.classes_for_dom.values()))))
+                self.sel_num_classes_per_dom[dom] = len(self.classes_for_dom[dom]) 
+                # Number of samples for each class in the domain is such that, over all domains
+                # each class gets the same number of samples 
+                num_doms_per_class = dict([(c, len(doms)) for c, doms in self.doms_for_classes.items()])
+                self.sel_num_samples_per_class[dom] = dict([((c,)+dom,  batch_size / class_count / num_doms_per_class[(c,)]) for c in self.classes_for_dom[dom]])
+
+                print("Selecting batches with %d classes for domain %s, with a number of samples for each class proportional to the inverse of the number of domains available for the class"%
+                    (self.sel_num_classes_per_dom[dom], dom_name))
+
+            elif balance_method in ['none', 'same_num_samples_per_class', 'same_num_classes_per_dom_then_same_num_samples_per_class']:
+                # In this case, each domain has the same number of classes. For none and same_num_samples_per_class,
+                # the domain has been set to a dummy value, so this still applies.
+                self.sel_num_samples_per_class[dom] = num_samples_per_class
+                sel_num_classes_per_batch = int(batch_size/num_samples_per_class)
+                self.sel_num_classes_per_dom[dom] = int(np.ceil(sel_num_classes_per_batch/len(self.domains)))
+                print("Selecting %d classes for domain %s, and %d samples per selected class"%(self.sel_num_classes_per_dom[dom], dom_name, self.sel_num_samples_per_class[dom]))
             else:
-                # In this case, each domain has the same number of speakers
-                self.num_spkrs_per_dom[dom] = int(np.ceil(self.num_spkrs_per_batch/len(self.domains)))
+                raise Exception("Balance method %s not implemented"%balance_method)
 
         self.sample_to_idx = dict(np.c_[self.metadata['sample_id'], np.arange(len(self.metadata['sample_id']))])
 
@@ -227,10 +276,8 @@ class TrialLoader(object):
 
     def __iter__(self):
 
-        # Yield num_batches containing batch_size/num_samples_per_spk speakers each, with
-        # num_samples_per_spk samples per speaker, each sample from a different session (if possible).
-
-        # Keep track of how many rounds through the speakers we do for each domain, just for
+        # Yield num_batches batches.
+        # Keep track of how many rounds through the classes we do for each domain, just for
         # logging and debugging purposes
         num_rewinds = dict([(d, 0) for d in self.domains])
 
@@ -242,20 +289,32 @@ class TrialLoader(object):
         
             sel_idxs = []
 
-            for dom in self.domains:
-                for numsp in np.arange(self.num_spkrs_per_dom[dom]):
+            while len(sel_idxs) < self.batch_size:
+                # Normally this should not need to loop more than once, but sometimes,
+                # due to rounding issues, we need to restart the loop to fill up the batch at the end.
+                
+                for dom in self.domains:
+                    for numcl in np.arange(self._random_round(self.sel_num_classes_per_dom[dom])):
+                        if len(sel_idxs) > self.batch_size:
+                            break
 
-                    # Select a speaker from this domain
-                    spk_dom, r = self._find_value(self.spki, self.spkrs_for_dom, dom)
-                    num_rewinds[dom] += r
+                        # Select a class from this domain
+                        class_dom, r = self._find_value(self.classi, self.classes_for_dom, dom)
+                        num_rewinds[dom] += r
 
-                    # For the selected speaker, select num_samples_per_spk samples all from different sessions
-                    for numsample in np.arange(self.num_samples_per_spk):
-                        # Only shuffle at rewind for the first sample, else we risk getting the same session again
-                        sess_spk_dom, _  = self._find_value(self.sessi, self.sess_for_spk_dom, spk_dom, shuffle_at_rewind=(numsample==0))
-                        # For the selected session, select one sample 
-                        sample_sess_spk_dom, _ = self._find_value(self.samplei, self.samples_for_sess_spk_dom, sess_spk_dom)
-                        sel_idxs += [self.sample_to_idx[sample_sess_spk_dom[0]]]
+                        if self.balance_method == 'same_num_samples_per_class_then_same_num_samples_per_dom':
+                            sel_num_samples = self.sel_num_samples_per_class[dom][class_dom]
+                        else:
+                            sel_num_samples = self.sel_num_samples_per_class[dom]
+
+                        # For the selected class, select num_samples_per_class samples all from different sessions
+                        for numsample in np.arange(self._random_round(sel_num_samples)):
+                            # Only shuffle at rewind for the first sample, else we risk getting the same session again
+                            sess_class_dom, _  = self._find_value(self.sessi, self.sessions_for_class_dom, class_dom, shuffle_at_rewind=(numsample==0))
+                            # For the selected session, select one sample 
+                            sample_sess_class_dom, _ = self._find_value(self.samplei, self.samples_for_sess_class_dom, sess_class_dom)
+                            sel_idxs += [self.sample_to_idx[sample_sess_class_dom[0]]]
+
 
             sel_idxs = np.array(sel_idxs)[:self.batch_size]
 
@@ -264,12 +323,18 @@ class TrialLoader(object):
             assert len(sel_idxs) == self.batch_size
             yield self._np_to_torch(self.embeddings[sel_idxs]), metadata_for_batch
 
-        if self.balance_by_domain:
-            print("Dumped %d batches with the following number of resets of the speaker lists per domain:"%self.num_batches)
+        if self.balance_method != 'none':
+            print("Created %d batches with the following number of resets of the class lists per domain:"%self.num_batches)
             for dom in self.domains:
-                print("  dom %s: %d resets, %d speakers"%(self.metamaps['domain_id'][dom[0]], num_rewinds[dom], len(self.spkrs_for_dom[dom])))
+                print("  dom %s: %d resets, %d classes"%(self.metamaps['domain_id'][dom[0]], num_rewinds[dom], len(self.classes_for_dom[dom])))
         else:
-            print("Dumped %d batches with %d resets, %d speakers."%(self.num_batches, num_rewinds[self.domains[0]], len(self.spkrs_for_dom[dom])))
+            print("Created %d batches with %d resets, %d classes."%(self.num_batches, num_rewinds[self.domains[0]], len(self.classes_for_dom[dom])))
+
+    @staticmethod
+    def _random_round(x):
+        # Round to an int by doing floor or ceil depending on the decimal part
+        round_func = np.ceil if random.random() < x-int(x) else np.floor
+        return int(round_func(x))
 
 
     def _np_to_torch(self, x):
