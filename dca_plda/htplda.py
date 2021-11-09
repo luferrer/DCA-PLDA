@@ -2,7 +2,6 @@
 # Luciana Ferrer added the functionality to (approximately) score with stats.
 
 import torch
-from IPython import embed
 from torch.autograd import Function
 from torch import as_tensor as ten
 import scipy
