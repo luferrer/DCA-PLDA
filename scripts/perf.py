@@ -1,5 +1,5 @@
 import argparse
-from scores import *
+from dca_plda.scores import Scores, compute_performance
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--ptar',  help='Prior for Cllr and DCF computation.', type=float, default=0.01)
