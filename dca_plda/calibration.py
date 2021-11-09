@@ -7,7 +7,6 @@ This code is only used to compute cllr and min_cllr in the Det class.
 import numpy as np
 from scipy.optimize import minimize, minimize_scalar
 from scipy.special import logit, expit
-from IPython import embed
 from sklearn._isotonic import _inplace_contiguous_isotonic_regression as fastpav
 
 
@@ -313,6 +312,5 @@ if __name__ == "__main__":
     tar, non, a, b, Ptar = randn(5), randn(10), randn()**2, randn(), rand()
     
     cal = logregCal(tar,non)
-    embed()
     print(cal)
 
