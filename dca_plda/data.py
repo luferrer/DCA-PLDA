@@ -9,7 +9,7 @@ from numpy.lib import recfunctions as rfn
 class LabelledDataset(Dataset):
     """Face Landmarks dataset."""
 
-    def __init__(self, emb_file, meta_file=None, meta_is_dur_only=False, device=None, cluster_ids=None):
+    def __init__(self, emb_file, meta_file=None, meta_is_dur_only=False, device=None, cluster_ids=None, skip_missing=False):
         """
         Args:
             emb_file (string):  File with embeddings and sample ids in npz format
@@ -94,8 +94,10 @@ class LabelledDataset(Dataset):
         name_to_idx = dict(zip(ids_all, np.arange(len(ids_all))))
         keep_idxs = np.array([name_to_idx.get(n, -1) for n in self.meta_raw['sample_id']])
         if np.any(keep_idxs == -1):
-            raise Exception("There are %d sample ids (out of %d in the metadata file %s) that are missing from the embeddings file %s.\nPlease, remove those files from the metadata file and try again"%
-                (np.sum(keep_idxs==-1), len(self.meta_raw), meta_file, emb_file))
+            print("There are %d sample ids (out of %d in the metadata file %s) that are missing from the embeddings file %s"%(np.sum(keep_idxs==-1), len(self.meta_raw), meta_file, emb_file))
+            if not skip_missing:
+                raise Exception("Please, remove missing files from the metadata file and try again")
+
         self.embeddings = embeddings_all[keep_idxs]
         self.ids = np.array(ids_all)[keep_idxs]
 
