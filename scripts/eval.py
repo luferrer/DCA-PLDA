@@ -38,7 +38,7 @@ model = load_model(opt.model, device)
 print("Loaded model from %s"%opt.model)
 
 ###### Load the data
-dataset = LabelledDataset(opt.embeddings, opt.durs, meta_is_dur_only=True, device=device)
+dataset = LabelledDataset(opt.embeddings, opt.durs, meta_is_dur_only=True, device=device, skip_missing=True)
 if model.enrollment_classes is not None:
     assert opt.enroll_map == 'NONE'
     if opt.level == 'level1':
