@@ -46,11 +46,12 @@
 # considered in training. As shown in our papers, when trained on a
 # larger variety of data, this model can also generalize to unseen
 # conditions.
+#
 
 
 # CPU or GPU number, if GPU is available
-device=0
-seed=1
+device=${1:-0}
+seed=${2:-0}
 
 # Sets used to choose the best model from the second stage
 dev_sets="heldout_vox heldout_vox_4-30sec" 

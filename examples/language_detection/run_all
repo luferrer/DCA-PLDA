@@ -10,33 +10,25 @@
 #
 # output/train*/*/seed*/stage*/eval_best/all_results
 #
-# The results include counts, EER, Cllr and DCF metrics. Cllr and DCF
-# are computed with two different ptar values. Also, we compute the
-# actual value as well as the min value for each case. The min values
-# for the Cllr metrics are computed in two different ways: by doing a
-# cheating linear logistic regression on the test data itself (the
-# ones called "LIN") and by using the PAV algorithm on the test data
-# (called "PAV"). The PAV estimates are slightly lower since that
-# model is non-parametric and can adapt more to the test data, which
-# might result in overfitting.
-#
-# Training is run in two stages, to allow for different training
-# parameters in each stage.  The model from the first iteration in
-# stage 1 correspond to a standard a PLDA backend. Scoring is done
-# by the usual approximation where all samples from each enrollment
-# model (a language's training data in this case) are averaged to
-# create a single vector. Note that, for PLDA, the proper scoring
-# approach gives better results. This repository does not yet
-# implement proper scoring.
+# See the run_all script in the speaker_verification dir for
+# an explanation on the results files and training process.
 #
 # Results from this script show that:
 #
 # * Simple Discriminative PLDA gives better results than PLDA
 # * The hierachical approach helps on unseen conditions 
-
+#
+# See the paper listed in the README for many more results using
+# a much larger training dataset.
+#
+# Note that the PLDA results here are somewhat suboptimal since they
+# do not use proper scoring but the approximate version. The
+# code used in the paper to compute the PLDA scores is SRI proprietary
+# and cannot be open sourced. We will eventually implement the proper
+# scoring formulation in this repository.
 
 # CPU or GPU number, if GPU is available
-device=0
+device=2
 seed=0
 
 # Sets used to choose the best model from the second stage
@@ -67,9 +59,9 @@ done
 # For full results with all metrics, look at the all_results files below
 dur=32
 printf "%-30s %-15s %-15s %-15s\n" "Set" "System" "Min-Cllr" "Actual-Cllr" > tmp$$
-./format_results $dur $out_dir/dplda_lda88/seed$seed/stage1/eval_ep0000/all_results    "1.PLDA"   >> tmp$$
-./format_results $dur $out_dir/dplda_lda88/seed$seed/stage2/eval_best/all_results      "2.DPLDA"  >> tmp$$
-./format_results $dur $out_dir/hdplda_lda65+22/seed$seed/stage2/eval_best/all_results  "3.HDPLDA" >> tmp$$
+../scripts/format_ld_results $dur $out_dir/dplda_lda88/seed$seed/stage1/eval_ep0000/all_results    "1.PLDA"   >> tmp$$
+../scripts/format_ld_results $dur $out_dir/dplda_lda88/seed$seed/stage2/eval_best/all_results      "2.DPLDA"  >> tmp$$
+../scripts/format_ld_results $dur $out_dir/hdplda_lda65+22/seed$seed/stage2/eval_best/all_results  "3.HDPLDA" >> tmp$$
 
 echo "Results on 32-second chunks"
 echo ""

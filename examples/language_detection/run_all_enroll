@@ -8,7 +8,7 @@
 # without the need for retraining the model.
 #
 # Note that for reenrollment to make sense, the model has to be trained
-# with some parameters frozen (see the stage1_frzenroll config)
+# with some parameters frozen (see the stage1_frzenroll config).
 #
 # Results from this script show that results after reenrollment are
 # significantly worse than when training from scratch using the new
