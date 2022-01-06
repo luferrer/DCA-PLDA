@@ -12,7 +12,7 @@ The code can also be used to train and evaluate a standard PLDA pipeline. Basica
 
 Further, the current version of the code can also be used to do language detection. In this case, we have not yet explored the use of condition-awereness, but rather focused on a novel hierachical approach, which is described in the following paper:
 
-*L. Ferrer, D. Castan, M. McLaren, and A. Lawson, ["A Hierarchical Model for Spoken Language Recognition"](https://arxiv.org/abs/2201.01364), arXiv:2201.01364, 2021
+*L. Ferrer, D. Castan, M. McLaren, and A. Lawson, ["A Hierarchical Model for Spoken Language Recognition"](https://arxiv.org/abs/2201.01364), arXiv:2201.01364, 2021*
 
 Example scripts and configuration files to do both speaker verification and language detection are provided in the examples directory.
 
