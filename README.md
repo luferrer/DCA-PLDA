@@ -10,9 +10,9 @@ We have found this system to provide great out-of-the-box performance across a v
 
 The code can also be used to train and evaluate a standard PLDA pipeline. Basically, the initial model before any training epochs is identical to a PLDA system, with an option for weighting the samples during training to compensate for imbalance across training domains.
 
-Further, the current version of the code can also be used to do language detection. In this case, we have not yet explored the use of condition-awereness, but rather focused on a novel hierachical approach, which is described in the following document, which has been submitted for review to a journal:
+Further, the current version of the code can also be used to do language detection. In this case, we have not yet explored the use of condition-awereness, but rather focused on a novel hierachical approach, which is described in the following paper:
 
-*L. Ferrer, D. Castan, M. McLaren, and A. Lawson, ["A Hierarchical Model for Spoken Language Recognition"](), 2021
+*L. Ferrer, D. Castan, M. McLaren, and A. Lawson, ["A Hierarchical Model for Spoken Language Recognition"](https://arxiv.org/abs/2201.01364), arXiv:2201.01364, 2021
 
 Example scripts and configuration files to do both speaker verification and language detection are provided in the examples directory.
 
