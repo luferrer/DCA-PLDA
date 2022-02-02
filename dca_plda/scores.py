@@ -8,6 +8,7 @@ import gzip
 from scipy.optimize import minimize
 from scipy.special import logit
 from dca_plda import calibration, utils
+import random
 
 class Key(object):
     """
@@ -247,7 +248,7 @@ class IdMap(object):
 
 def compute_performance(scores, keylist, outfile, ptar=0.01, setname=None, enrollment_ids=None):
     """
-    Print to screen the average R-Precision over enrolled models
+    Compute several performance metrics and print them in outfile
     """
 
     outf = open(outfile, "w")
@@ -285,6 +286,165 @@ def compute_performance(scores, keylist, outfile, ptar=0.01, setname=None, enrol
             act_cllrs[1], min_cllrs[1], min_cllrs_pav[1], 
             act_dcfs[0], min_dcfs[0],
             act_dcfs[1], min_dcfs[1]))
+
+
+def compute_performance_with_confidence_intervals(scores, keylist, outfile, logid2spk_dict, logid2ses_dict=None, ptar=0.01, setname=None, num_boot_samples=1000, percentile=5):
+    """
+    Compute EER, Actual and Min Cllr, and Actual and Min DCF (for the given ptar)
+    including confidence intervals obtained with bootstrapping. The function needs
+    a dictionary from logid to speaker id and another dictionary from logid to session
+    id in order to generate samples by speaker and session as well as by logid.
+    That is, each bootstrap sample is composed by a random selection (with replacement)
+    of speakers, sessions and logids.
+    If the logid2ses_dict is None, it does not include that part of the randomization.
+    This should be used when there's a single logid per session in which case, randomizing
+    the sessions and the logids would probably be wrong.
+    This code is very slow for large datasets. It would have to be optimized (probably using
+    indexes instead of strings) for use in those cases. 
+    """
+
+    outf = open(outfile, "w")
+    outf.write("%-32s |    EER      EERp5    EERp95 |   ACLLR ACLLRp5 ACLLRp95 |   MCLLR   MCLLRp5  MCLLRp95  |   ADCF  ADCFp5  ADCFp95 |    MDCF  MDCFp5  MDCFp95 \n"%"Key")
+
+    randomize_by_logid = True
+    if logid2ses_dict is None:
+        # If this dict is not provided, do not randomize both by session and logid, just do it once
+        randomize_by_logid = False
+
+    from IPython import embed
+
+
+    for keyf in [l.strip() for l in open(keylist).readlines()]:
+        key  = Key.load(keyf)
+        name = re.sub('.h5$', '', os.path.basename(keyf))
+        if setname is not None:
+            name="%s:%s"%(setname,name)
+
+        # Metrics for the full key
+        ascores = scores.align(key)
+        tar = ascores.score_mat[key.mask==1]
+        non = ascores.score_mat[key.mask==-1]
+        det_all = Det(tar, non, key)
+
+        mdcf_all  = det_all.min_dcf(ptar)
+        adcf_all  = det_all.act_dcf(ptar)
+        mcllr_all = det_all.min_cllr(ptar)
+        acllr_all = det_all.act_cllr(ptar)
+        eer_all   = det_all.eer()*100
+
+        # Keep only the speakers for which some logid is present in the key
+        logid_list = np.unique(key.test_ids + key.enroll_ids)
+
+        if not randomize_by_logid:
+            # Assign a dummy session id to be the same as the logid
+            logid2ses_dict = dict([(l, l) for l in logid_list])
+
+        sesid_list = np.unique([logid2ses_dict[logid] for logid in logid_list]) 
+        spkid_list = np.unique([logid2spk_dict[logid] for logid in logid_list])
+        
+        print("Original key, num_spk = %d, num_sess = %d, num_logids = %d, num_tgt = %d, num_imp = %d, acllr = %.2f"%
+            (len(np.unique(spkid_list)),
+             len(np.unique(sesid_list)),
+             len(np.unique(logid_list)),
+             len(tar), len(non), acllr_all))
+
+        # Create a dict of sessions for each speaker 
+        spk2ses_dict = dict()
+        for spk in spkid_list:
+            # First, get the list of logids for the speaker
+            logids_for_spk = [logid for logid, s in logid2spk_dict.items() if s == spk]
+            # Then, use the logid2ses dict to get the list of sessions
+            spk2ses_dict[spk] = np.unique([ses for logid, ses in logid2ses_dict.items() if logid in logids_for_spk])
+
+        # Create a dict of logids for each session
+        ses2lid_dict = dict()
+        for ses in logid2ses_dict.values():
+            # Get the list of logids for the session
+            ses2lid_dict[ses] = [logid for logid, s in logid2ses_dict.items() if s == ses]
+
+        # Lists for accumulating results over each bootstrap sample
+        mdcfs, adcfs, acllrs, mcllrs, eers  = [], [], [], [], []
+
+        for nboot in range(num_boot_samples):
+            
+            # Sample speakers 
+            sel_spks = np.array(random.choices(spkid_list, k=len(spkid_list)))
+
+            # Get the list of sessions for the selected speakers
+            ses_for_sel_spks = np.unique(np.concatenate([spk2ses_dict[spk] for spk in sel_spks]))
+
+            # Sample those sessions
+            sel_sess = np.array(random.choices(ses_for_sel_spks, k=len(ses_for_sel_spks)))
+
+            # Get the list of logids for those sessions
+            lid_for_sel_sess = np.unique(np.concatenate([ses2lid_dict[ses] for ses in sel_sess]))
+
+            # Finally, sample those logids or copy the sess id list
+            sel_lids = np.array(random.choices(lid_for_sel_sess, k=len(lid_for_sel_sess)) if randomize_by_logid else sel_sess)
+
+            # Get a dict with the correct number of repetitions for each lid.
+            # This number is given by the number of times the lid is repeated in 
+            # sel_lids, multiplied by the number of times the session for that lid is repeated
+            # in sel_sess, multiplied the number of times the speaker for that lid is repeated
+            # in sel_spks
+            num_rep_dict = dict()
+            for lid in logid_list:
+                spk = logid2spk_dict[lid]
+                ses = logid2ses_dict[lid]
+                nlid = len(np.where(sel_lids==lid)[0]) 
+                nses = len(np.where(sel_sess==ses)[0]) 
+                nspk = len(np.where(sel_spks==spk)[0]) 
+                num_rep_dict[lid] = nlid*nses*nspk
+            
+            # For each test and enroll id, find out how many times
+            # it needs to be included in the new key (could be 0, 1 or more)
+            def select_indexes(llist):
+                sel_idxs = []
+                for j, logid in enumerate(llist):
+                    sel_idxs += [j]*num_rep_dict[logid]
+                return np.array(sel_idxs)
+
+            sel_test_idxs   = select_indexes(key.test_ids)
+            sel_enroll_idxs = select_indexes(key.enroll_ids)
+
+            sel_key = Key(np.array(key.test_ids)[sel_test_idxs], np.array(key.enroll_ids)[sel_enroll_idxs], key.mask[np.ix_(sel_enroll_idxs,sel_test_idxs)])
+ 
+            ascores = scores.align(sel_key)
+            tar = ascores.score_mat[sel_key.mask==1]
+            non = ascores.score_mat[sel_key.mask==-1]
+            det = Det(tar, non, sel_key)
+
+            mdcfs.append(det.min_dcf(ptar))
+            adcfs.append(det.act_dcf(ptar))
+            mcllrs.append(det.min_cllr(ptar))
+            acllrs.append(det.act_cllr(ptar))
+            eers.append(det.eer()*100)
+
+            print("Sample %d, num_spk = %d, num_sess = %d, num_logids = %d, num_tgt = %d, num_imp = %d, acllr = %.2f"%(nboot, 
+                len(np.unique(sel_spks)),
+                len(np.unique(sel_sess)),
+                len(np.unique(sel_lids)),
+                len(tar), len(non), acllrs[-1]))
+
+        def get_conf_int(boot_values):
+            return [np.percentile(boot_values, percentile), np.percentile(boot_values, 100-percentile)]
+
+        mdcf_ci  = get_conf_int(mdcfs)
+        adcf_ci  = get_conf_int(adcfs)
+        mcllr_ci = get_conf_int(mcllrs)
+        acllr_ci = get_conf_int(acllrs)
+        eer_ci   = get_conf_int(eers)
+
+        outf.write("%-32s |  %6.2f   %6.2f  %6.2f   |  %7.4f  %7.4f  %7.4f  |  %7.4f  %7.4f  %7.4f  | %7.4f %7.4f %7.4f  | %7.4f %7.4f %7.4f  \n"%
+            (name, 
+            eer_all,   *eer_ci,  
+            acllr_all, *acllr_ci,
+            mcllr_all, *mcllr_ci,
+            adcf_all,  *adcf_ci,
+            mdcf_all,  *mdcf_ci))
+
+    return
+
 
 
 
