@@ -96,8 +96,8 @@ class DCA_PLDA_Backend(nn.Module):
 
         lda_dim = self.config.get('lda_dim')
         if lda_dim:
-            # LDA stage enabled by default. 
-            self.lda_stage  = Affine(in_dim, lda_dim, "l2norm")
+            # LDA stage enabled by default.
+            self.lda_stage  = Affine(in_dim, lda_dim, self.config.get('activation_after_lda', 'l2norm'))
         else:
             lda_dim = in_dim
 
@@ -199,7 +199,7 @@ class DCA_PLDA_Backend(nn.Module):
 
         if hasattr(self, 'lda_stage'):
             x2e = self.lda_stage(xe) if hase else None
-            x2t = self.lda_stage(xt) 
+            x2t = self.lda_stage(xt)
         else:
             x2e = xe
             x2t = xt
