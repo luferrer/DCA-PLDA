@@ -1,0 +1,36 @@
+#!/bin/bash -e
+
+# Two examples for running post-hoc score calibration.  The first
+# example uses simulated data, saved with numpy in npz format.  The
+# second example takes h5 score files and keys as input.  For
+# training, information about the classes is needed. In the npz
+# format, the training expects two arrays (pos and neg). In the h5
+# format, a separate key file, also in h5 format, is expected.
+#
+# For testing, if keys are provided, eval metrics are computed and
+# printed in screen.  For testing without keys in the npz format, a
+# single array can be provided, called 'all'.
+
+export PYTHONPATH=../../:$PYTHONPATH
+scripts=../../scripts
+
+# Example with simulated perfectly-normal data in npz format
+python generate_data.py
+python $scripts/train_score_calibrator.py trn_scores.npz params.npz
+python $scripts/eval_score_calibrator.py tst_scores.npz params.npz tst_scores.cal
+
+# Eval with an input that is not split in pos and neg (for when the key is not available during testing)
+python $scripts/eval_score_calibrator.py tst_scores_nokey.npz params.npz tst_scores_nokey.cal.npz
+
+# Example using scores from the speaker_verification example in h5 format
+list_dir=../speaker_verification/data/eval
+expt_dir=../speaker_verification/output/train_vox/dplda/seed0/stage1/eval_ep0000
+trn_key=$list_dir/voxceleb2/keys/all.h5
+tst_key=$list_dir/sitw.eval/keys/all.h5
+trn_sc=$expt_dir/voxceleb2/scores.h5
+tst_sc=$expt_dir/sitw.eval/scores.h5
+
+python $scripts/train_score_calibrator.py --fmt h5 --key $trn_key $trn_sc params2.npz
+python $scripts/eval_score_calibrator.py  --fmt h5 --key $tst_key $tst_sc params2.npz sitw.eval.cal
+
+rm params.npz params2.npz trn_scores.npz tst_scores.npz tst_scores_nokey.npz sitw.eval.cal.h5 tst_scores.cal.npz tst_scores_nokey.cal.npz.npz
