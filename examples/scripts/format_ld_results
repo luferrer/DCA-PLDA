@@ -1,0 +1,8 @@
+#!/bin/bash
+
+dur=$1
+res=$2
+name=$3
+
+cat $res | fgrep test.$dur.key | gawk -v n="$name" '{gsub(/:.*/,"",$1); printf "%-30s %-15s %-15s %-15s\n", $1, n, $9, $8}'
+
