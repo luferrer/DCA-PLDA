@@ -294,25 +294,20 @@ def compute_performance_with_confidence_intervals(scores, keylist, outfile, logi
     including confidence intervals obtained with bootstrapping. The function needs
     a dictionary from logid to speaker id and another dictionary from logid to session
     id in order to generate samples by speaker and session as well as by logid.
-    That is, each bootstrap sample is composed by a random selection (with replacement)
-    of speakers, sessions and logids.
-    If the logid2ses_dict is None, it does not include that part of the randomization.
-    This should be used when there's a single logid per session in which case, randomizing
-    the sessions and the logids would probably be wrong.
-    This code is very slow for large datasets. It would have to be optimized (probably using
-    indexes instead of strings) for use in those cases. 
+    Each bootstrap sample is composed by a random selection (with replacement)
+    of speakers, sessions from those speakers and logids from those sessions.
+    When there's a single logid per session, logid2ses_dict should be set to None.
+    This code is very slow for large datasets. It would probably have to be optimized 
+    for use in those cases. 
     """
 
     outf = open(outfile, "w")
-    outf.write("%-32s |    EER      EERp5    EERp95 |   ACLLR ACLLRp5 ACLLRp95 |   MCLLR   MCLLRp5  MCLLRp95  |   ADCF  ADCFp5  ADCFp95 |    MDCF  MDCFp5  MDCFp95 \n"%"Key")
+    outf.write("%-32s |    EER      EERp5    EERp95 |   ACLLR ACLLRlow ACLLRup   |   MCLLR   MCLLRlow MCLLRup   |   ADCF  ADCFlow  ADCFup  |    MDCF  MDCFlow MDCFup \n"%"Key")
 
     randomize_by_logid = True
     if logid2ses_dict is None:
         # If this dict is not provided, do not randomize both by session and logid, just do it once
         randomize_by_logid = False
-
-    from IPython import embed
-
 
     for keyf in [l.strip() for l in open(keylist).readlines()]:
         key  = Key.load(keyf)
