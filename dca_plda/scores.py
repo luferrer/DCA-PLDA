@@ -48,13 +48,14 @@ class Key(object):
         else:
             func = gzip.open if os.path.splitext(filename)[1] == ".gz" else open
             with func(filename) as f:
-                lines = [line.strip().split(' ')[0:3] for line in f]
+                lines = [line.strip().split(' ') for line in f]
 
             if len(lines[0]) == 3:
                 enrollids_in_key, testids_in_key, _ = map(lambda t: list(set(t)), zip(*lines))
             elif len(lines[0]) == 2:
-                testids_in_key, _ = map(lambda t: list(set(t)), zip(*lines))
-                enrollids_in_key = enrollids
+                testids_in_key, enrollids_in_key = map(lambda t: list(set(t)), zip(*lines))
+                if enrollids is not None:
+                    enrollids_in_key = enrollids
             else:
                 raise Exception("Need 3 columns for a SID key or 2 for LID key (file %s)."%filename)
             mask_in_key = None
@@ -101,11 +102,12 @@ class Key(object):
                 # appear in the key, it stays 0
                 mask = np.zeros((nbT, nbt),dtype=np.int8)
                 for t, e in lines:
-                    if e in idxenrollids and t in idxtestids:
+                    if t in idxtestids:
                         # for the test files that do appear in the key, set
                         # the mask to -1 except for the true language
                         mask[:, idxtestids[t]] = -1
-                        mask[idxenrollids[e], idxtestids[t]] = 1
+                        if e in idxenrollids:
+                            mask[idxenrollids[e], idxtestids[t]] = 1
 
         return Key(enrollids, testids, mask)
 
@@ -254,38 +256,93 @@ def compute_performance(scores, keylist, outfile, ptar=0.01, setname=None, enrol
     outf = open(outfile, "w")
     ptars = [ptar, 0.5]
  
-    outf.write("%-32s                                            |         Ptar=%4.2f           |         Ptar=%4.2f           |    Ptar=%4.2f    |   Ptar=%4.2f  \n"%(" ",ptars[0],ptars[1], ptars[0], ptars[1]))
-    outf.write("%-32s | #TGT(#missing) #IMP(#missing) |    EER   |   ACLLR MCLLR_LIN MCLLR_PAV |   ACLLR MCLLR_LIN MCLLR_PAV |  ADCF    MDCF   |   ADCF   MDCF  \n"%"Key")
+    header = compute_performance_from_arrays(None, None, ptars, missing_tar=0)
+    outf.write(header)
 
     for keyf in [l.strip() for l in open(keylist).readlines()]:
 
         key  = Key.load(keyf, enrollids=enrollment_ids)
-        name = re.sub('.h5$', '', os.path.basename(keyf))
+        name = re.sub('.key$','',re.sub('.h5$', '', os.path.basename(keyf)))
         if setname is not None:
             name="%s:%s"%(setname,name)
 
         ascores = scores.align(key)
         tar = ascores.score_mat[key.mask==1]
         non = ascores.score_mat[key.mask==-1]
-        det = Det(tar, non, pav=True)
-
         missing_tar = np.sum((key.mask==1)*ascores.missing)
         missing_non = np.sum((key.mask==-1)*ascores.missing)
-        min_dcfs = det.min_dcf(ptars)
-        act_dcfs = det.act_dcf(ptars)
-        act_cllrs = det.act_cllr(ptars)
-        min_cllrs = det.min_cllr(ptars)
-        min_cllrs_pav = det.min_cllr(ptars, with_pav=True)
-        #min_cllrs_pav = [np.nan, np.nan]
-        eer = det.eer(from_rocch=True)
-        outf.write("%-32s | %14s %14s |  %6.2f  |  %7.4f  %7.4f  %7.4f  |  %7.4f  %7.4f  %7.4f  | %7.4f %7.4f | %7.4f %7.4f \n"%(name, 
-            "%d(%d)"%(len(det.tar), missing_tar), 
-            "%d(%d)"%(len(det.non), missing_non), 
-            eer*100, 
-            act_cllrs[0], min_cllrs[0], min_cllrs_pav[0], 
-            act_cllrs[1], min_cllrs[1], min_cllrs_pav[1], 
-            act_dcfs[0], min_dcfs[0],
-            act_dcfs[1], min_dcfs[1]))
+        line, _ = compute_performance_from_arrays(tar, non, ptars, name, missing_tar, missing_non)
+        outf.write(line)
+
+
+def compute_performance_from_arrays(tar, non, ptars, name='all', missing_tar=None, missing_non=None):
+
+    # Construct the header
+
+    header  = "%-32s                                            |         Ptar=%4.2f           |         Ptar=%4.2f           |    Ptar=%4.2f    |   Ptar=%4.2f  \n"%(" ",ptars[0],ptars[1], ptars[0], ptars[1])
+    if missing_tar is not None:
+        header += "%-32s | #TGT(#missing) #IMP(#missing) "%"Key"
+    else:
+        header += "%-32s |      #TGT         #IMP        "%"Key"
+    header += "|    EER   |   ACLLR MCLLR_LIN MCLLR_PAV |   ACLLR MCLLR_LIN MCLLR_PAV |  ADCF    MDCF   |   ADCF   MDCF   |   AUC  \n"
+    
+    if tar is None:
+        return header
+
+    det = Det(tar, non, pav=True)
+
+    min_dcfs      = det.min_dcf(ptars)
+    act_dcfs      = det.act_dcf(ptars)
+    act_cllrs     = det.act_cllr(ptars)
+    min_cllrs     = det.min_cllr(ptars)
+    min_cllrs_pav = det.min_cllr(ptars, with_pav=True)
+    eer           = det.eer(from_rocch=True)
+    auc           = 1-det.AUC()
+
+    count_tar = "%d"%len(det.tar)
+    count_non = "%d"%len(det.non)
+    
+    if missing_tar is not None:
+        count_tar = "%s(%d)"%(count_tar, missing_tar)
+        count_non = "%s(%d)"%(count_non, missing_non)
+
+    line = "%-32s | %14s %14s |  %6.2f  |  %7.4f  %7.4f  %7.4f  |  %7.4f  %7.4f  %7.4f  | %7.4f %7.4f | %7.4f %7.4f | %7.4f \n"%(name, 
+        count_tar, 
+        count_non,
+        eer*100, 
+        act_cllrs[0], min_cllrs[0], min_cllrs_pav[0], 
+        act_cllrs[1], min_cllrs[1], min_cllrs_pav[1], 
+        act_dcfs[0], min_dcfs[0],
+        act_dcfs[1], min_dcfs[1], 
+        auc)
+
+
+
+    return line,  header    
+
+
+
+def print_perf(pos, neg, name, ptars):
+
+    det           = dscores.Det(pos, neg, pav=True)
+    min_dcfs      = det.min_dcf(ptars)
+    act_dcfs      = det.act_dcf(ptars)
+    act_cllrs     = det.act_cllr(ptars)
+    min_cllrs     = det.min_cllr(ptars)
+    min_cllrs_pav = det.min_cllr(ptars, with_pav=True)
+    eer           = det.eer(from_rocch=True)
+
+    print("%-22s |  %6d  %6d |  %6.2f  |  %7.4f  %7.4f  %7.4f  |  %7.4f  %7.4f  %7.4f  | %7.4f %7.4f | %7.4f %7.4f "%
+          (name,
+           len(det.tar),
+           len(det.non),
+           eer*100,
+           act_cllrs[0], min_cllrs[0], min_cllrs_pav[0],
+           act_cllrs[1], min_cllrs[1], min_cllrs_pav[1],
+           act_dcfs[0], min_dcfs[0],
+           act_dcfs[1], min_dcfs[1]))
+
+
 
 
 def compute_performance_with_confidence_intervals(scores, keylist, outfile, logid2spk_dict, logid2ses_dict=None, ptar=0.01, setname=None, num_boot_samples=1000, percentile=5):
@@ -310,8 +367,6 @@ def compute_performance_with_confidence_intervals(scores, keylist, outfile, logi
     if logid2ses_dict is None:
         # If this dict is not provided, do not randomize both by session and logid, just do it once
         randomize_by_logid = False
-
-    from IPython import embed
 
 
     for keyf in [l.strip() for l in open(keylist).readlines()]:
@@ -511,6 +566,10 @@ class Det(object):
             idxeer=np.argmin(np.abs(self.Pfa-self.Pmiss))
             return 0.5*(self.Pfa[idxeer]+self.Pmiss[idxeer])
 
+
+    def AUC(self):
+        return calibration.ROCCH(self.pav).AUC()
+  
 
     def act_dcf(self, ptar, normalize=True):
         """

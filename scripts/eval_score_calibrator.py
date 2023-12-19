@@ -5,25 +5,6 @@ from dca_plda import calibration
 from dca_plda import scores as dscores
 import numpy as np
 
-def print_perf(pos, neg, name, ptars):
-
-    det           = dscores.Det(pos, neg, pav=True)
-    min_dcfs      = det.min_dcf(ptars)
-    act_dcfs      = det.act_dcf(ptars)
-    act_cllrs     = det.act_cllr(ptars)
-    min_cllrs     = det.min_cllr(ptars)
-    min_cllrs_pav = det.min_cllr(ptars, with_pav=True)
-    eer           = det.eer(from_rocch=True)
-
-    print("%-22s |  %6d  %6d |  %6.2f  |  %7.4f  %7.4f  %7.4f  |  %7.4f  %7.4f  %7.4f  | %7.4f %7.4f | %7.4f %7.4f "%
-          (name,
-           len(det.tar),
-           len(det.non),
-           eer*100,
-           act_cllrs[0], min_cllrs[0], min_cllrs_pav[0],
-           act_cllrs[1], min_cllrs[1], min_cllrs_pav[1],
-           act_dcfs[0], min_dcfs[0],
-           act_dcfs[1], min_dcfs[1]))
 
     
 parser = argparse.ArgumentParser(description="Train a post-hoc score calibrator using linear logistic regression.")
@@ -82,7 +63,6 @@ else:
 if has_key:
     print("Results before and after calibration on test %d positive and %d negative samples"%(len(raw_pos), len(raw_neg)))
     ptars = [opt.ptar, 0.5]
-    print("%-22s                              |         Ptar=%4.2f           |         Ptar=%4.2f           |    Ptar=%4.2f    |   Ptar=%4.2f  "%(" ",ptars[0], ptars[1], ptars[0], ptars[1]))
-    print("%-22s |   #TGT   #IMP   |    EER   |   ACLLR MCLLR_LIN MCLLR_PAV |   ACLLR MCLLR_LIN MCLLR_PAV |  ADCF    MDCF   |   ADCF   MDCF  "%"Key")   
-    print_perf(raw_pos, raw_neg, "before calibration", ptars)
-    print_perf(cal_pos, cal_neg, "after calibration",  ptars)
+    line1, header = dscores.compute_performance_from_arrays(raw_pos, raw_neg, ptars, "before calibration")
+    line2, header = dscores.compute_performance_from_arrays(cal_pos, cal_neg, ptars, "after calibration")
+    print(header, line1, line2, sep='')
