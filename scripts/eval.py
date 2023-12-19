@@ -6,8 +6,9 @@ import torch.backends.cudnn as cudnn
 import torch.optim as optim
 
 from dca_plda.data import LabelledDataset
-from dca_plda.utils_for_scripts import np_to_torch, evaluate, load_model, mkdirp, setup_torch_and_cuda_vars
+from dca_plda.utils_for_scripts import evaluate, load_model, mkdirp, setup_torch_and_cuda_vars
 from dca_plda.scores import IdMap, compute_performance
+from dca_plda.utils import np_to_torch
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--cuda',     help='Enables cuda.', action='store_true')
