@@ -994,12 +994,15 @@ class HTPLDA(nn.Module):
         return htplda.score_matrix_with_stats(self.H, self.F, self.nu, Me.T, xtm.T, Ne)
 
 
-    def init_with_plda_trained_generatively(self, x, class_ids, init_params, domain_ids=None):
+    def init_with_plda_trained_generatively(self, x, class_ids, init_params, domain_ids=None, sample_weights=None):
         # Compute a PLDA model with the input data, approximating the 
         # model with just the usual initialization without the EM iterations
 
+        if sample_weights is not None and np.any(sample_weights!=1):
+            raise Exception("Sample weights not implemented for HT-PLDA initialization")
+        
         if init_params.get('balance_method'):
-            raise Exception("Balance methos not implemented for HT-PLDA initialization")
+            raise Exception("Balance method not implemented for HT-PLDA initialization")
 
         class_weights = None
         nu = init_params.get('htplda_nu', 10000)
