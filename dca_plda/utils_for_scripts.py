@@ -20,7 +20,7 @@ from dca_plda import modules
 from dca_plda import data as ddata
 from dca_plda.scores import IdMap, Key, Scores
 from dca_plda import calibration 
-from dca_plda.utils import *
+from dca_plda import utils
 
 
 def mkdirp(dir):
@@ -49,7 +49,7 @@ def test_model(model, data_dict, model_name, ptar, loss_type, print_min_loss=Fal
         # Since the key mask was created to be aligned to the emap and tmap, the score_mat
         # is already aligned to this mask
         loss, llrs, labels = modules.compute_loss(scores.score_mat, mask=mask, ptar=ptar, loss_type=loss_type, return_info=True)
-
+        
         if level1_loss_weight:
             # Compute the loss for the inner level of the hierarchical model and add it to the loss
             mask_level1 = info['mask_level1']
@@ -81,7 +81,7 @@ def load_data_dict(table, device, fixed_enrollment_ids=None, map_enrollment_ids_
     for line in open(table).readlines():
         f = line.strip().split()
         name, emb, key, emapf, tmapf = f[0:5]
-        dur = f[5] if len(f) > 3 else None
+        dur = f[5] if len(f) > 5 else None
         dataset = ddata.LabelledDataset(emb, dur, meta_is_dur_only=True, device=device)
         if fixed_enrollment_ids is not None:
             # Enrollment embeddings are part of the model, not provided in the data
@@ -95,7 +95,7 @@ def load_data_dict(table, device, fixed_enrollment_ids=None, map_enrollment_ids_
         tmap = IdMap.load(tmapf, dataset.get_ids())
         # Load key file in the order in which the model ids were loaded in emap 
         # and tmap. This ensures that the scores and keys will be aligned.
-        mask = np_to_torch(Key.load(key, emap.model_ids, tmap.model_ids).mask, device)
+        mask = utils.np_to_torch(Key.load(key, emap.model_ids, tmap.model_ids).mask, device)
 
         if map_enrollment_ids_to_level1 is not None:
             # Derive the mask for level1 from the map between level1 and output fixed_enrollment_ids
@@ -259,7 +259,7 @@ def train_epoch(model, loader, optimizer, epoch, config, debug_dir=None):
         if debug_dir:
             print_batch(batches_file, metadata, loader.metamaps, batch_idx)
 
-        durs = metadata['duration']
+        durs = metadata.get('duration')
         if level1_loss_weight:
             output, output_level1, _ = model(data, durs, all_levels=True)
         else:
@@ -369,15 +369,19 @@ def evaluate(model, dataset, emap, tmap, min_dur=0, raw=False, level=None, clust
             scoresk = torch.zeros(len(eidsk), len(tids))  
             for i in np.arange(k):
                 eidx = emapk[i]
+                edur = durs[eidx] if durs is not None else None
+                tdur = durs[tidx] if durs is not None else None
+                
                 if model.enrollment_classes is None:
-                    scoreski = model.score(data[tidx], data[eidx], durs[tidx], durs[eidx], raw=raw)
-                    scoreski[durs[eidx]<min_dur, :] = 0
+                    scoreski = model.score(data[tidx], data[eidx], tdur, edur, raw=raw)
+                    if durs is not None:
+                        scoreski[edur<min_dur, :] = 0
                 else:
                     # Enrollment embeddings are part of the model
                     if level is not None or cluster_prior_dict is not None:
-                        scoreski_output, scoreski_level1, scoreski_level2 = model.score(data[tidx], None, durs[tidx], None, raw=raw, all_levels=True, cluster_prior_dict=cluster_prior_dict)
+                        scoreski_output, scoreski_level1, scoreski_level2 = model.score(data[tidx], None, tdur, None, raw=raw, all_levels=True, cluster_prior_dict=cluster_prior_dict)
                     else:
-                        scoreski_output = model.score(data[tidx], None, durs[tidx], None, raw=raw)
+                        scoreski_output = model.score(data[tidx], None, tdur, None, raw=raw)
 
                     if level == 'level1':
                         scoreski = scoreski_level1[eidx]
@@ -386,7 +390,8 @@ def evaluate(model, dataset, emap, tmap, min_dur=0, raw=False, level=None, clust
                     else:
                         scoreski = scoreski_output[eidx]                    
 
-                scoreski[:, durs[tidx]<min_dur] = 0
+                if durs is not None:
+                    scoreski[:, tdur<min_dur] = 0
                 scoresk += scoreski
             scoresk /= k
             scores.append(scoresk)
