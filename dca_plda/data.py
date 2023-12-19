@@ -9,7 +9,7 @@ from numpy.lib import recfunctions as rfn
 class LabelledDataset(Dataset):
     """Face Landmarks dataset."""
 
-    def __init__(self, emb_file, meta_file=None, meta_is_dur_only=False, device=None, cluster_ids=None, skip_missing=False):
+    def __init__(self, emb_file, meta_file=None, meta_is_dur_only=False, meta_has_dur=True, device=None, cluster_ids=None, skip_missing=False):
         """
         Args:
             emb_file (string):  File with embeddings and sample ids in npz format
@@ -45,9 +45,9 @@ class LabelledDataset(Dataset):
 
         print("  Done loading embeddings")
         embeddings_all = data_dict['data']
-        if type(data_dict['ids'][0]) == np.bytes_:
+        if type(data_dict['ids'][0]) in [np.bytes_, bytes]:
             ids_all = [i.decode('UTF-8') for i in data_dict['ids']]
-        elif type(data_dict['ids'][0]) == np.str_:
+        elif type(data_dict['ids'][0]) in [np.str_, str]:
             ids_all = data_dict['ids']
         else:
             raise Exception("Bad format for ids in embeddings file %s (should be strings)"%emb_file)
@@ -62,8 +62,10 @@ class LabelledDataset(Dataset):
         else:
             if meta_is_dur_only:
                 fields, formats = zip(*[('sample_id', 'O'), ('duration', 'float32')])
-            else:
+            elif meta_has_dur:
                 fields, formats = zip(*[('sample_id', 'O'), ('class_id', 'O'), ('session_id', 'O'), ('domain_id', 'O'), ('duration', 'float32')])
+            else:
+                fields, formats = zip(*[('sample_id', 'O'), ('class_id', 'O'), ('session_id', 'O'), ('domain_id', 'O')])
             self.meta_raw = np.loadtxt(meta_file, np.dtype({'names': fields, 'formats': formats}))
 
             if cluster_ids is not None:
