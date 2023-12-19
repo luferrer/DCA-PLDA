@@ -1227,10 +1227,10 @@ def compute_weights(class_ids, domain_ids, balance_method=False, external_sample
             # The weight for each domain is given by the inverse of the number of classes for that domain    
             # If all domains have the same number of classes, then all weights are 1.0
             dom_weight[d] = len(unique_cids)*1.0/len(np.unique(class_ids[domain_ids==d]))/len(unique_doms)
-            print("Weights per domain: %s"%dom_weight)
         else:
             # Dummy weight of 1 for all domains
             dom_weight[d] = 1.0
+    print("Weights per domain: %s"%dom_weight)
 
     # The weight for each class is given by the weight for the domain to which it belongs.
     # This assumes each class belongs to a single domain, which will mostly be the case for speaker id,
