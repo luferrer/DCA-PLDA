@@ -1,0 +1,44 @@
+#!/bin/bash -e
+
+# Given a list of systems, a set of conditions and a performance metric, collect the results into a table
+
+system_list=$1
+metric=${2:-ADCF}
+condition_list=${3:-conditions/ALL}
+
+case $metric in
+    EER)    f=17;;
+    Cllr)   f=20;;
+    ADCF)   f=13;;
+    MDCF)   f=15;;
+    TGT)    f=2;;
+    IMP)    f=3;;
+esac
+
+printf "%-20s " "SYSTEM"
+
+cat $condition_list |\
+    while read gname conditions; do
+	printf "%6s  " $gname
+    done
+echo ""
+
+cat $system_list | egrep -v '^#' |\
+    while read name sys; do
+
+	echo $name | gawk '{printf "%-20s ",$1}'
+
+	cat $condition_list |\
+	    while read dname dset; do
+		dsetn=`echo $dset | sed 's,:.*,,'`
+
+		if [ ! -f $sys/$dsetn/results ]; then
+		    echo -n "ERROR "
+		else			    
+		    gawk -v dset=$dsetn '$1=="KEY:"{name=$2}$1=="True#"&&donehead==0{print "SET ",$0; donehead=1}$NF=="Average" || $NF=="Pooled"{print dset":"name, $0}' $sys/$dsetn/results | gawk -v f=$f -v c=$dset '$1==c{if(f==13 || f==15) $f*=2; printf "%6.3f ", $f}'
+		fi
+	    done 
+	echo ""
+    done
+
+

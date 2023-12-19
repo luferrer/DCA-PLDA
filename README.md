@@ -33,7 +33,7 @@ We will appreciate any feedback about the code or the approaches. Also, please l
 
 3. If you want to run the example code, download the pre-computed embeddings for the task you want to run from:  
 
-   ```https://sftp.speech.sri.com/forms/DCA-DPLDA```   
+   [```https://sftp.speech.sri.com/forms/DCA-DPLDA```](https://sftp.speech.sri.com/forms/DCA-DPLDA)
    
    Untar the file and move (or link) the resulting data/ dir inside the example dir for the task you want to run. 
 
