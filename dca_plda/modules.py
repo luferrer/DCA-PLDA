@@ -249,7 +249,6 @@ class DCA_PLDA_Backend(nn.Module):
 
     def init_params_with_data(self, embeddings, metadata, metamaps, trn_config, device=None, label_name='class_id', sample_weights=None, new_enrollment_classes=None):
 
-        balance_method = trn_config.get("balance_method_for_batches")
         assert 'init_params' in trn_config
         init_params = trn_config.init_params
         init_components = init_params.get('init_components', 'all')
@@ -265,6 +264,9 @@ class DCA_PLDA_Backend(nn.Module):
 
             class_ids  = metadata[label_name]
             domain_ids = metadata['domain_id']
+
+            if sample_weights is None:
+                sample_weights = compute_weights(class_ids, domain_ids, init_params.get("balance_method"))['sample_weights']    
             
             if hasattr(self,'front_stage'):
                 if 'front' in init_components:
@@ -365,7 +367,7 @@ class DCA_PLDA_Backend(nn.Module):
             if batch_size == 'all':
                 # Batch size needs to be a multiple of num_samples_per_class
                 batch_size = int(np.floor(len(class_ids)/trn_config.num_samples_per_class)*trn_config.num_samples_per_class)
-            loader = ddata.TrialLoader(embeddings, metadata, metamaps, device, seed=0, batch_size=batch_size, num_batches=1, balance_method=balance_method, check_count_per_sess=False)
+            loader = ddata.TrialLoader(embeddings, metadata, metamaps, device, seed=0, batch_size=batch_size, num_batches=1, balance_method=trn_config.get("balance_method_for_batches"), check_count_per_sess=False)
             x, meta_batch = next(loader.__iter__())
             
             x  = self.front_stage(x) if hasattr(self,'front_stage') else x
@@ -1225,6 +1227,7 @@ def compute_weights(class_ids, domain_ids, balance_method=False, external_sample
             # The weight for each domain is given by the inverse of the number of classes for that domain    
             # If all domains have the same number of classes, then all weights are 1.0
             dom_weight[d] = len(unique_cids)*1.0/len(np.unique(class_ids[domain_ids==d]))/len(unique_doms)
+            print("Weights per domain: %s"%dom_weight)
         else:
             # Dummy weight of 1 for all domains
             dom_weight[d] = 1.0
@@ -1235,8 +1238,6 @@ def compute_weights(class_ids, domain_ids, balance_method=False, external_sample
     class_weights = np.ones_like(unique_cids, dtype=float)
     for s in unique_cids:
         class_weights[s] = dom_weight[domain_ids[np.where(class_ids==s)[0][0]]]
-
-    print("Weights per domain: %s"%dom_weight)
 
     return {'class_weights': class_weights, 'sample_weights': sample_weights}
 
