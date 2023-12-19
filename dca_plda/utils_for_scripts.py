@@ -105,7 +105,7 @@ def load_data_dict(table, device, fixed_enrollment_ids=None, map_enrollment_ids_
                 idxs = np.array([emap.model_ids.index(l) for l, c in map_enrollment_ids_to_level1.items() if c==cluster])
                 mask_level1[i,torch.where(mask[idxs]==1)[1]] = 1
             emap_level1 = IdMap.load('NONE', fixed_enrollment_ids_level1)    
-            #mask_level1 = np_to_torch(mask_level1, device)
+
         else:
             mask_level1 = None
             emap_level1 = None
@@ -127,11 +127,11 @@ def train(model, trn_dataset, config, dev_table, out_dir, device,
         dev_data_dict = load_data_dict(dev_table, device, model.enrollment_classes)
         
     param_names = [k for k, v in model.named_parameters()]
-    config['l2_reg_dict'] = expand_regexp_dict(param_names, config.l2_reg)
+    config['l2_reg_dict'] = utils.expand_regexp_dict(param_names, config.l2_reg)
     num_epochs = config.num_epochs
 
     # Initialize the optimizer and learning rate scheduler
-    parameters = get_parameters_to_train(model, config.get('freeze_params'))
+    parameters = utils.get_parameters_to_train(model, config.get('freeze_params'))
     optimizer = optim.Adam(parameters, lr=config.learning_rate, betas=config.betas)
     lr_scheduler = None
 
@@ -156,7 +156,7 @@ def train(model, trn_dataset, config, dev_table, out_dir, device,
 
 
     # Load the last available model if restart is set or initialize with data if no previous checkpoint is available
-    last_checkpoint, last_epoch, last_dev_loss = find_checkpoint(out_dir)
+    last_checkpoint, last_epoch, last_dev_loss = utils.find_checkpoint(out_dir)
 
     if restart and last_checkpoint is not None:
 
@@ -165,12 +165,12 @@ def train(model, trn_dataset, config, dev_table, out_dir, device,
         if last_epoch == 0:
             # We are loading the zeroth epoch which might be from a prior stage or just the initialization with data, 
             # so, do not load the optimizer's or lr_scheduler check point in this case
-            load_checkpoint(last_checkpoint, model, device)
+            utils.load_checkpoint(last_checkpoint, model, device)
         else:           
-            load_checkpoint(last_checkpoint, model, device, optimizer, lr_scheduler)
+            utils.load_checkpoint(last_checkpoint, model, device, optimizer, lr_scheduler)
 
-        best_checkpoint,  best_epoch,  best_dev_loss  = find_checkpoint(out_dir, "best")
-        first_checkpoint, first_epoch, first_dev_loss = find_checkpoint(out_dir, "first")
+        best_checkpoint,  best_epoch,  best_dev_loss  = utils.find_checkpoint(out_dir, "best")
+        first_checkpoint, first_epoch, first_dev_loss = utils.find_checkpoint(out_dir, "first")
 
     else:
 
@@ -184,7 +184,7 @@ def train(model, trn_dataset, config, dev_table, out_dir, device,
         embeddings, metadata, metamaps = trn_dataset.get_data_and_meta(init_subset)
         trn_loss = model.init_params_with_data(embeddings, metadata, metamaps, config, device=device)
         dev_loss = test_model(model, dev_data_dict, "Epoch 0000", config.ptar, config.loss, print_min_loss=print_min_loss, level1_loss_weight=config.get("level1_loss_weight"))
-        checkpoint = save_checkpoint(model, out_dir, 0, trn_loss, dev_loss, optimizer, lr_scheduler)
+        checkpoint = utils.save_checkpoint(model, out_dir, 0, trn_loss, dev_loss, optimizer, lr_scheduler)
 
         best_checkpoint,  best_epoch,  best_dev_loss  = checkpoint, 0, dev_loss
         first_checkpoint, first_epoch, first_dev_loss = checkpoint, 0, dev_loss
@@ -200,7 +200,7 @@ def train(model, trn_dataset, config, dev_table, out_dir, device,
     for epoch in range(start_epoch, num_epochs + 1):
         trn_loss = train_epoch(model, loader, optimizer, epoch, config, debug_dir=out_dir if debug else None)
         dev_loss = test_model(model, dev_data_dict, "Epoch %04d"%epoch, config.ptar, config.loss, print_min_loss=print_min_loss, level1_loss_weight=config.get("level1_loss_weight"))
-        checkpoint = save_checkpoint(model, out_dir, epoch, trn_loss, dev_loss, optimizer, lr_scheduler)
+        checkpoint = utils.save_checkpoint(model, out_dir, epoch, trn_loss, dev_loss, optimizer, lr_scheduler)
 
         if dev_loss < best_dev_loss:
             best_checkpoint = checkpoint
@@ -220,20 +220,20 @@ def train(model, trn_dataset, config, dev_table, out_dir, device,
 
     if config.compute_ave_model:
         # Average the best/first N models and retest. Stop when the performance starts degrading
-        checkpoints, _, devlosses = find_checkpoint(out_dir, config.compute_ave_model, n=num_epochs)
+        checkpoints, _, devlosses = utils.find_checkpoint(out_dir, config.compute_ave_model, n=num_epochs)
         cur_ave_dev_loss = devlosses[0]
         prev_ave_dev_loss = 100000
-        load_checkpoint(checkpoints[0], model, device)
+        utils.load_checkpoint(checkpoints[0], model, device)
         print("Starting averaging of models with %s"%checkpoints[0])
         n = 1
         while cur_ave_dev_loss < prev_ave_dev_loss:
             print("Updating average with %s"%checkpoints[n])
-            update_model_with_weighted_average(model, checkpoints[n], device, n)
+            utils.update_model_with_weighted_average(model, checkpoints[n], device, n)
             prev_ave_dev_loss = cur_ave_dev_loss
             cur_ave_dev_loss = test_model(model, dev_data_dict, "Average %s n=%03d"%(config.compute_ave_model,n), config.ptar, config.loss, print_min_loss=print_min_loss)
             print("New devloss = %f"%cur_ave_dev_loss)
             n += 1
-        save_checkpoint(model, out_dir, dev_loss=dev_loss, name="ave_%s"%config.compute_ave_model)
+        utils.save_checkpoint(model, out_dir, dev_loss=dev_loss, name="ave_%s"%config.compute_ave_model)
         
     Path("%s/DONE"%out_dir).touch()
 
@@ -296,7 +296,7 @@ def train_epoch(model, loader, optimizer, epoch, config, debug_dir=None):
 
         l2_reg_dict = config.get("l2_reg_dict")
         if l2_reg_dict is not None:
-            regt = l2_reg_term(model.named_parameters(), config.l2_reg_dict)
+            regt = utils.l2_reg_term(model.named_parameters(), config.l2_reg_dict)
         
         llr_reg_dict = config.get("llr_reg")
         if llr_reg_dict is not None:
