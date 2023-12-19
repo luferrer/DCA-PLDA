@@ -35,10 +35,11 @@ parser.add_argument('--configs',      help='List of configuration files to load.
 parser.add_argument('--mods',         help='List of values to overwride config parameters. Example: training.num_epochs=20,architecture.lda_dim=200', default=None)
 parser.add_argument('--init_subset',  help='Subset of the train files to be used for initialization. For default, the files in trn_metafile are used.', default=None)
 parser.add_argument('--restart',      help='Restart training from last available model.', action='store_true')
+parser.add_argument('--no_dur',       help='Metadata does not include duration column.', action='store_true')
 parser.add_argument('--print_min_loss', help='Print the min loss for each dev set at each epoch.', action='store_true')
 parser.add_argument('trn_embeddings', help='Path to the npz file with training embeddings.')
 parser.add_argument('trn_metafile',   help='Path to the metadata for the training samples (all samples listed in this file should be present in the embeddings file).')
-parser.add_argument('dev_table',      help='Path to a table with one dev set per line, including: name, npz file with embeddings, key file, and durations file (can be missing if not using duration-dependent calibration).')
+parser.add_argument('dev_table',      help='Path to a table with one dev set per line, including: name, npz file with embeddings, key file, enrollment map, test map, and durations file (can be missing if not using duration-dependent calibration). Enrollment and test maps are files with a first column with the enroll/test id (as in the key) and a second column with the corresponding sample id. Each enroll/test id can have more than one line, corresponding to different sample ids.')
 parser.add_argument('out_dir',        help='Output directory for models.')
 
 opt = parser.parse_args()
@@ -58,7 +59,7 @@ device = setup_torch_and_cuda_vars(opt.cuda)
 
 ###### Load the dataset and create the model object
 cluster_ids = get_class_to_cluster_map_from_config(config.architecture)
-trn_dataset = LabelledDataset(opt.trn_embeddings, opt.trn_metafile, cluster_ids=cluster_ids)
+trn_dataset = LabelledDataset(opt.trn_embeddings, opt.trn_metafile, cluster_ids=cluster_ids, meta_has_dur=(not opt.no_dur))
 in_size = trn_dataset[0]['emb'].shape[0]
 
 if cluster_ids:
