@@ -194,7 +194,7 @@ class DCA_PLDA_Backend(nn.Module):
         return self.score(x, durt=durations)
 
     def score(self, xt, xe=None, durt=None, dure=None, si_only=False, raw=False, subset_enrollment_idxs=None, emap=None):
-        # Same as the forward method but it allows for assymetric scoring where the rows and columns
+        # Same as the forward method but it allows for asymmetric scoring where the rows and columns
         # of the resulting score file corresponds to two different sets of data.
         # It also allows for an enrollment map which can be used for proper scoring for multi-enrollment cases.
         # This option, though, does not yet work when using duration or side information branches.
@@ -380,7 +380,7 @@ class DCA_PLDA_Backend(nn.Module):
             if batch_size == 'all':
                 # Batch size needs to be a multiple of num_samples_per_class
                 batch_size = int(np.floor(len(class_ids)/trn_config.num_samples_per_class)*trn_config.num_samples_per_class)
-            loader = ddata.TrialLoader(embeddings, metadata, metamaps, device, seed=0, batch_size=batch_size, num_batches=1, balance_method=balance_method, check_sess_count=False)
+            loader = ddata.TrialLoader(embeddings, metadata, metamaps, device, seed=0, batch_size=batch_size, num_batches=1, balance_method=balance_method, check_count_per_sess=False)
             x, meta_batch = next(loader.__iter__())
             
             x  = self.front_stage(x) if hasattr(self,'front_stage') else x
@@ -1244,7 +1244,8 @@ def compute_weights(class_ids, domain_ids, balance_method=False, external_sample
             sample_weights *= utils.compute_weights_to_balance_by_class(class_x_dom)
             num_dom_per_class =  np.array([len(np.unique(domain_ids[class_ids==c])) for c in unique_cids])
             sample_weights *= 1/num_dom_per_class[class_ids]
-
+        utils.print_weights_by_class(class_x_dom, sample_weights)
+    
     dom_weight = np.ones_like(unique_doms, dtype=float)
     for d in unique_doms:
         if balance_method is True or balance_method == 'same_num_classes_per_dom_then_same_num_samples_per_class':
@@ -1263,7 +1264,7 @@ def compute_weights(class_ids, domain_ids, balance_method=False, external_sample
         class_weights[s] = dom_weight[domain_ids[np.where(class_ids==s)[0][0]]]
 
     print("Weights per domain: %s"%dom_weight)
-    utils.print_weights_by_class(class_x_dom, sample_weights)
+
 #    print("Sample weights: %s"%sample_weights)
     
     return {'class_weights': class_weights, 'sample_weights': sample_weights}
