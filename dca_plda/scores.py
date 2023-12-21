@@ -42,13 +42,13 @@ class Key(object):
                 testids_in_key   = f['test_ids'][()]
                 mask_in_key      = f['trial_mask'][()]
 
-                if type(enrollids_in_key[0]) == np.bytes_:
+                if type(enrollids_in_key[0]) in [bytes, np.bytes_]:
                     enrollids_in_key = [i.decode('UTF-8') for i in enrollids_in_key]
                     testids_in_key   = [i.decode('UTF-8') for i in testids_in_key]
         else:
             func = gzip.open if os.path.splitext(filename)[1] == ".gz" else open
             with func(filename) as f:
-                lines = [line.strip().split(' ') for line in f]
+                lines = [line.strip().split(' ')[0:3] for line in f]
 
             if len(lines[0]) == 3:
                 enrollids_in_key, testids_in_key, _ = map(lambda t: list(set(t)), zip(*lines))
@@ -111,6 +111,19 @@ class Key(object):
 
         return Key(enrollids, testids, mask)
 
+    def save(self, outfile, fmt = 'h5'):
+        if fmt == 'h5':
+            with h5py.File(outfile,'w') as f:
+                f.create_dataset('test_ids',   data=np.string_(self.test_ids))
+                f.create_dataset('enroll_ids', data=np.string_(self.enroll_ids))
+                f.create_dataset('mask',       data=self.mask)
+        else:
+            with open(outfile, 'w') as f:
+                for ti, t in enumerate(self.test_ids):
+                    for ei, e in enumerate(self.enroll_ids):
+                        if self.mask[ei, ti] != 0:
+                            print("%s %s %f"%(e,t, self.mask[ei, ti]), file=f)
+    
 
 class Scores(object):
     """
@@ -180,7 +193,7 @@ class Scores(object):
             testids   = f['test_ids'][()]
             scores    = f['scores'][()]
 
-            if type(enrollids[0]) == np.bytes_:
+            if type(enrollids[0]) in [bytes, np.bytes_]:
                 enrollids = [i.decode('UTF-8') for i in enrollids]
                 testids   = [i.decode('UTF-8') for i in testids]
 
@@ -248,7 +261,7 @@ class IdMap(object):
         return idmap
 
 
-def compute_performance(scores, keylist, outfile, ptar=0.01, setname=None, enrollment_ids=None):
+def compute_performance(scores, keylist, outfile, ptar=0.01, setname=None, enrollment_ids=None, auc=False):
     """
     Compute several performance metrics and print them in outfile
     """
@@ -256,7 +269,7 @@ def compute_performance(scores, keylist, outfile, ptar=0.01, setname=None, enrol
     outf = open(outfile, "w")
     ptars = [ptar, 0.5]
  
-    header = compute_performance_from_arrays(None, None, ptars, missing_tar=0)
+    header = compute_performance_from_arrays(None, None, ptars, missing_tar=0, auc=auc)
     outf.write(header)
 
     for keyf in [l.strip() for l in open(keylist).readlines()]:
@@ -271,11 +284,11 @@ def compute_performance(scores, keylist, outfile, ptar=0.01, setname=None, enrol
         non = ascores.score_mat[key.mask==-1]
         missing_tar = np.sum((key.mask==1)*ascores.missing)
         missing_non = np.sum((key.mask==-1)*ascores.missing)
-        line, _ = compute_performance_from_arrays(tar, non, ptars, name, missing_tar, missing_non)
+        line, _ = compute_performance_from_arrays(tar, non, ptars, name, missing_tar, missing_non, auc=auc)
         outf.write(line)
 
 
-def compute_performance_from_arrays(tar, non, ptars, name='all', missing_tar=None, missing_non=None):
+def compute_performance_from_arrays(tar, non, ptars, name='all', missing_tar=None, missing_non=None, auc=False):
 
     # Construct the header
 
@@ -284,8 +297,13 @@ def compute_performance_from_arrays(tar, non, ptars, name='all', missing_tar=Non
         header += "%-32s | #TGT(#missing) #IMP(#missing) "%"Key"
     else:
         header += "%-32s |      #TGT         #IMP        "%"Key"
-    header += "|    EER   |   ACLLR MCLLR_LIN MCLLR_PAV |   ACLLR MCLLR_LIN MCLLR_PAV |  ADCF    MDCF   |   ADCF   MDCF   |   AUC  \n"
-    
+
+    if auc:
+        header += "|    EER   |   ACLLR MCLLR_LIN MCLLR_PAV |   ACLLR MCLLR_LIN MCLLR_PAV |  ADCF    MDCF   |   ADCF   MDCF   |   AUC  \n"
+    else:
+        header += "|    EER   |   ACLLR MCLLR_LIN MCLLR_PAV |   ACLLR MCLLR_LIN MCLLR_PAV |  ADCF    MDCF   |   ADCF   MDCF   \n"
+
+        
     if tar is None:
         return header
 
@@ -297,7 +315,8 @@ def compute_performance_from_arrays(tar, non, ptars, name='all', missing_tar=Non
     min_cllrs     = det.min_cllr(ptars)
     min_cllrs_pav = det.min_cllr(ptars, with_pav=True)
     eer           = det.eer(from_rocch=True)
-    auc           = 1-det.AUC()
+    if auc:
+        auc       = 1-det.AUC()
 
     count_tar = "%d"%len(det.tar)
     count_non = "%d"%len(det.non)
@@ -306,16 +325,19 @@ def compute_performance_from_arrays(tar, non, ptars, name='all', missing_tar=Non
         count_tar = "%s(%d)"%(count_tar, missing_tar)
         count_non = "%s(%d)"%(count_non, missing_non)
 
-    line = "%-32s | %14s %14s |  %6.2f  |  %7.4f  %7.4f  %7.4f  |  %7.4f  %7.4f  %7.4f  | %7.4f %7.4f | %7.4f %7.4f | %7.4f \n"%(name, 
+    line = "%-32s | %14s %14s |  %6.2f  |  %7.4f  %7.4f  %7.4f  |  %7.4f  %7.4f  %7.4f  | %7.4f %7.4f | %7.4f %7.4f "%(name, 
         count_tar, 
         count_non,
         eer*100, 
         act_cllrs[0], min_cllrs[0], min_cllrs_pav[0], 
         act_cllrs[1], min_cllrs[1], min_cllrs_pav[1], 
         act_dcfs[0], min_dcfs[0],
-        act_dcfs[1], min_dcfs[1], 
-        auc)
+        act_dcfs[1], min_dcfs[1])
 
+    if auc:
+        line += "| %7.4f "%auc
+
+    line += "\n"
 
 
     return line,  header    
