@@ -14,7 +14,7 @@ from dca_plda import htplda
 from dca_plda import generative
 
 def compute_loss(llrs, metadata=None, ptar=0.01, mask=None, loss_type='cross_entropy', return_info=False, 
-    enrollment_ids=None, ids_to_idxs=None, class_name='class_id'):
+                 enrollment_ids=None, ids_to_idxs=None, class_name='class_id', return_key=False):
 
     if metadata is None:
         assert mask is not None
@@ -43,6 +43,8 @@ def compute_loss(llrs, metadata=None, ptar=0.01, mask=None, loss_type='cross_ent
     ptart = torch.as_tensor(ptar)
     tarw = (labels == 1).float()
     impw = (labels == 0).float()
+
+#    print("Num tar %d, num imp %d"%(tarw.sum(), impw.sum()))
     
     if "weighted" in loss_type:
         # Weights determined so that positive and negative samples are also balanced within each detector
@@ -74,7 +76,11 @@ def compute_loss(llrs, metadata=None, ptar=0.01, mask=None, loss_type='cross_ent
         raise Exception("Unknown loss_type %s"%loss_type)
 
     if return_info:
-        return loss, llrs, labels
+        if return_key:
+            key = (same_class.clone().detach().int()*2-1)*valid
+            return loss, llrs, labels, key
+        else:
+            return loss, llrs, labels
     else:
         return loss
 
@@ -187,10 +193,15 @@ class DCA_PLDA_Backend(nn.Module):
         # The forward method assumes the same enroll and test data. This is used in training.
         return self.score(x, durt=durations)
 
-    def score(self, xt, xe=None, durt=None, dure=None, si_only=False, raw=False, subset_enrollment_idxs=None):
+    def score(self, xt, xe=None, durt=None, dure=None, si_only=False, raw=False, subset_enrollment_idxs=None, emap=None):
         # Same as the forward method but it allows for assymetric scoring where the rows and columns
-        # of the resulting score file corresponds to two different sets of data
+        # of the resulting score file corresponds to two different sets of data.
+        # It also allows for an enrollment map which can be used for proper scoring for multi-enrollment cases.
+        # This option, though, does not yet work when using duration or side information branches.
 
+        if emap is not None and (self.cal_stage.is_sidep or self.cal_stage.is_durdep):
+            raise Exception("Proper scoring not yet implemented when using a side-information- or duration-dependent calibration")
+            
         hase = xe is not None
 
         if hasattr(self, 'front_stage'):
@@ -205,6 +216,7 @@ class DCA_PLDA_Backend(nn.Module):
             x2t = xt
 
         if hasattr(self,'si_stage1'):
+
             si_inpute = xe if self.si_input == 'main_input' else x2e
             si_inputt = xt if self.si_input == 'main_input' else x2t
              
@@ -241,7 +253,7 @@ class DCA_PLDA_Backend(nn.Module):
                 dure = torch.ones(scrs.shape[0]).to(scrs.device) if durt is not None else None
                 sie  = torch.ones([scrs.shape[0], sit.shape[1]]).to(scrs.device) if sit is not None else None
             else:
-                scrs = self.plda_stage.score(x2t, x2e)
+                scrs = self.plda_stage.score(x2t, x2e, emap)
 
             llrs = self.cal_stage.calibrate(scrs, durt, sit, dure, sie)            
             return llrs if raw is False else scrs
@@ -249,6 +261,7 @@ class DCA_PLDA_Backend(nn.Module):
 
     def init_params_with_data(self, embeddings, metadata, metamaps, trn_config, device=None, label_name='class_id', sample_weights=None, new_enrollment_classes=None):
 
+        balance_method = trn_config.get("balance_method_for_batches")
         assert 'init_params' in trn_config
         init_params = trn_config.init_params
         init_components = init_params.get('init_components', 'all')
@@ -266,8 +279,8 @@ class DCA_PLDA_Backend(nn.Module):
             domain_ids = metadata['domain_id']
 
             if sample_weights is None:
-                sample_weights = compute_weights(class_ids, domain_ids, init_params.get("balance_method"))['sample_weights']    
-            
+                sample_weights = compute_weights(class_ids, domain_ids, init_params.get("balance_method"))['sample_weights']
+                                            
             if hasattr(self,'front_stage'):
                 if 'front' in init_components:
                     print("Initializing front stage")
@@ -367,7 +380,7 @@ class DCA_PLDA_Backend(nn.Module):
             if batch_size == 'all':
                 # Batch size needs to be a multiple of num_samples_per_class
                 batch_size = int(np.floor(len(class_ids)/trn_config.num_samples_per_class)*trn_config.num_samples_per_class)
-            loader = ddata.TrialLoader(embeddings, metadata, metamaps, device, seed=0, batch_size=batch_size, num_batches=1, balance_method=trn_config.get("balance_method_for_batches"), check_count_per_sess=False)
+            loader = ddata.TrialLoader(embeddings, metadata, metamaps, device, seed=0, batch_size=batch_size, num_batches=1, balance_method=balance_method, check_sess_count=False)
             x, meta_batch = next(loader.__iter__())
             
             x  = self.front_stage(x) if hasattr(self,'front_stage') else x
@@ -401,6 +414,8 @@ class DCA_PLDA_Backend(nn.Module):
             mask = torch.ones_like(same_class, dtype=torch.int8)
             mask[~same_class] = -1
             mask[~valid] = 0
+
+#            utils.print_batch(open("first_batch","w"), meta_batch, loader.metamaps, 0, mask)
 
             return compute_loss(llrs, mask=mask, ptar=trn_config.ptar, loss_type=trn_config.loss)
 
@@ -860,7 +875,12 @@ class Quadratic(nn.Module):
         # The forward method assumes the same enroll and test data. This is used in training.
         return self.score(x)
 
-    def score(self, xt, xe=None):
+    def score(self, xt, xe=None, emap=None):
+
+        # emap is for doing proper scoring, which we cannot do with this specific implementation of PLDA
+        # because we do not have the original PLDA parameters available.
+        assert emap is None
+        
         # PLDA-like computation. The output i, j is given by
         # 2 * xi^T L xj + xi^T G xi + xj^T G xj + xi^T C + xj^T C + k
         if xe is None:
@@ -975,7 +995,7 @@ class HTPLDA(nn.Module):
         # The forward method assumes the same enroll and test data. This is used in training.
         return self.score(x)
 
-    def score(self, xt, xe=None):
+    def score(self, xt, xe=None, emap=None):
  
         if xe is None:
             xe = xt
@@ -983,8 +1003,9 @@ class HTPLDA(nn.Module):
         xem = xe-self.mu.T
         xtm = xt-self.mu.T
 
-        return htplda.score_matrix(self.H, self.F, self.nu, xem.T, xtm.T)
+        return htplda.score_matrix(self.H, self.F, self.nu, xem.T, xtm.T, emap)
 
+    
     def score_with_stats(self, xt, M, N):
 
         Me  = M - self.mu.T
@@ -1001,7 +1022,8 @@ class HTPLDA(nn.Module):
         if sample_weights is not None and np.any(sample_weights!=1):
             raise Exception("Sample weights not implemented for HT-PLDA initialization")
         
-        if init_params.get('balance_method'):
+        balance_method = init_params.get('balance_method')
+        if (balance_method not in [None, 'none']) or sample_weights is not None:
             raise Exception("Balance method not implemented for HT-PLDA initialization")
 
         class_weights = None
@@ -1222,7 +1244,6 @@ def compute_weights(class_ids, domain_ids, balance_method=False, external_sample
             sample_weights *= utils.compute_weights_to_balance_by_class(class_x_dom)
             num_dom_per_class =  np.array([len(np.unique(domain_ids[class_ids==c])) for c in unique_cids])
             sample_weights *= 1/num_dom_per_class[class_ids]
-        #utils.print_weights_by_class(class_x_dom, sample_weights)
 
     dom_weight = np.ones_like(unique_doms, dtype=float)
     for d in unique_doms:
@@ -1233,7 +1254,6 @@ def compute_weights(class_ids, domain_ids, balance_method=False, external_sample
         else:
             # Dummy weight of 1 for all domains
             dom_weight[d] = 1.0
-    print("Weights per domain: %s"%dom_weight)
 
     # The weight for each class is given by the weight for the domain to which it belongs.
     # This assumes each class belongs to a single domain, which will mostly be the case for speaker id,
@@ -1242,5 +1262,9 @@ def compute_weights(class_ids, domain_ids, balance_method=False, external_sample
     for s in unique_cids:
         class_weights[s] = dom_weight[domain_ids[np.where(class_ids==s)[0][0]]]
 
+    print("Weights per domain: %s"%dom_weight)
+    utils.print_weights_by_class(class_x_dom, sample_weights)
+#    print("Sample weights: %s"%sample_weights)
+    
     return {'class_weights': class_weights, 'sample_weights': sample_weights}
 
