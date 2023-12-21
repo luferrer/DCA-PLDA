@@ -13,7 +13,7 @@ import os
 from numpy.linalg import cholesky as chol
 from scipy.linalg import solve_triangular
 from pathlib import Path
-
+from dca_plda import scores
 
 def save_checkpoint(model, outdir, epoch=None, trn_loss=None, dev_loss=None, optimizer=None, scheduler=None, name="model"):
     
@@ -414,3 +414,20 @@ def get_class_to_cluster_map_from_config(config):
     return class_to_cluster_map
 
 
+def print_batch(outf, metadata, maps, batch_num, key=None):
+
+    metadata_str = dict()
+    for k in metadata.keys():
+        if k in ['sample_id', 'class_id', 'session_id', 'domain_id']:
+            v = metadata[k].detach().cpu().numpy()
+            metadata_str[k] = np.atleast_2d([maps[k][i] for i in v])
+
+    batch_str = np.ones_like(metadata_str['sample_id'])
+    batch_str[:] = str(batch_num)
+    np.savetxt(outf, np.concatenate([batch_str] + list(metadata_str.values())).T, fmt="%s")
+
+    if key is not None:
+        ids = metadata_str['sample_id'][0]
+        scores.Key(ids, ids, key.detach().cpu().numpy()).save("%s.%d"%(outf.name,batch_num), 'ascii')
+
+                                                                                        
