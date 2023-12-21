@@ -153,6 +153,9 @@ def loglikelihoods(Eigen,A,b, deriv=False):
     bE = b*Ecol
     logdets =  torch.log1p(bE).sum(axis=0)  # logdet(P), for every b
     bE1 = 1+bE
+
+#    from IPython import embed
+#    embed()
     R = (V.T @ A) / bE1
     S =  V @ R      # P\a, for every column a in A    
     y = (A*S).sum(axis=0)
@@ -203,7 +206,7 @@ def G_WF_L(H,F,deriv=False):
     W = H @ H.T            # (D,D)
     WF = W @ F             # (D,d)
     B = F.T @ WF           # (d,d) 
-    E, V = torch.symeig(B,eigenvectors=True)    # B = V @ E @ V.T
+    E, V = torch.linalg.eigh(B, UPLO='U') # B = V @ E @ V.T
     Ecol = E.reshape(-1,1)
     
     Eigen = E, V, Ecol 
