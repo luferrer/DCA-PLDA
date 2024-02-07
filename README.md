@@ -65,6 +65,39 @@ For the language detection example, the Voxlingua107 audio samples can be obtain
 
 Once you have extracted embeddings for all that data using your own procedure, you can set up all the lists and embeddings in the same way and with the same format (hdf5 or npz in the case of embeddings) as in the example data dir for your task of interest and use the run_all script. 
 
+The training script train.py takes several inputs:
+
+* A metadata file with 5 columns:
+	* file id: a name that identifies a certain speech segment. This name is then used to find the embeddings in the embeddings file described below.
+   * speaker id: a unique name for the speaker in the file.
+   * session id: a unique name for the session from which the file was extracted. This information is used to avoid creating same-session trials. The session should be the same the two sides of a telephone conversation, for a raw and a degraded file or for chunks extracted from that file. It is important to have this information be accurate since otherwise same-session trials may be created and those would degrade performance of the resulting model.
+	* domain id: an identifier for the domain from which the file comes from. This can be the dataset name. This information is used to avoid having cross-domain impostor trials that would be extremely easy to classify and, if the config sets balance_batches_by_domain to True, to create the batches with equal number of samples per domain.
+   * duration: this should be the duration of the speech within the file (as accurately extracted as possible, ie, probably an energy-based speech activity detector would not be enough) in seconds, with at least two digits after the decimal point.
+
+* An optional metadata file which should be a subset of the file above to be used during initialization. While you can use the same set of files to initialize and run optimization, it is generally unnecessary to use all the available training data for initialization.
+
+* A file with the embeddings for each of file id. The formats allowed by the code are npz and hdf5. In both cases, the code expects a dictionary with a data field containing the matrix of embeddings (one row per sample), and an ids field, containing the list of file ids, in the same order as the embeddings in the data field.
+
+* A table with one line for each of the development sets to be used to report performance after each epoch, which is then used to select the best epoch, containing the following information
+	* Dataset name
+	* Path to the embeddings file for that dataset (in the same format as for training)
+	* A file with the key for this dataset. The formats allowed for the key can be found in the Key class in dca_plda/scores.py. Basically, you can provide it in ascii format: enrollment_id test_id label (imp or tgt), or in h5 format as a dictionary with enroll_ids, test_ids and trial_mask with 1 for target, -1 for impostor and 0 for non-scored trials.
+	* A file with two columns: enrollment_id (as in the key above) and sample_id as in the embeddings file. For multi-sample enrollment, list several lines with the same enrollment_id.
+	* A file as the one above but for the test ids. This file will generally just have two columns identical to each other with the test sample ids 
+	* A file with the duration for each sample used for enrollment and testing 
+
+* A config file describing the architecture of the model. You can reuse the ones provided in the examples. 
+
+* A config file for each stage of training. You can also probably reuse the ones provided in the examples.
+
+The code will generate log files in the output dirs which you should inspect to see if things look as expected (ie, number of read samples, number of embeddings, etc).
+
+When done, train.py will have generated a lot of models, one per epoch. The best model per run can be found in the folder corresponding to the last training stage, with the name best_*.
+
+Then, the script eval.py takes the same info that goes in the table for the devsets above.
+
+You can run train.py and eval.py with the —help flag to see what the expected inputs are.
+
 
 ## Note on scoring multi-sample enrollment models
 
