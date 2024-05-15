@@ -113,6 +113,214 @@ def compute_2cov_plda_model(x, class_ids, weights, em_its=0, init_ids=None):
 
     return BCov, WCov, np.atleast_2d(mu)
 
+
+
+
+def compute_gca_model(scores, mask, embeddings_test, embeddings_enroll, k, ptar=0.1, num_it=3):    
+    """ Code to compute a GCA model as proposed in Borgstrom's
+    'A Generative Approach to Condition-Aware Score Calibration for Speaker Verification'
+    This code needs improvements since it is highly innefficient. This will be done in 
+    the near future.
+    """
+
+
+    def Q_func(params, N1, N0, r1, r0, r, rx, rxx, N, D):
+
+        phi_mat = []
+        for kk in range(len(params['phii'])):
+            phi_mat.append(np.diag(params['phii'][kk]))
+
+        Q1 = - N/2 * (1+ 2*D) * np.log(2*np.pi) + np.log(params['rho']) * sum(N1) 
+        Q2 = np.log(1-params['rho']) * sum(N0) + 0.5* sum((N1 + N0) * (2*np.log(params['w']) + np.log(params['lambi']) + np.log(abs(np.linalg.det(phi_mat))))) 
+        Q3 = -0.5* sum(params['lambi'] * (r -2* r1 * params['muT'] -2* r0 * params['muN'] + N1 * params['muT'] * params['muT'] + N0 * params['muN'] * params['muN'])) 
+        Q4 = -0.5 * sum(sum(params['phii'] *(rxx - 2 * rx * params['theta'] + np.transpose((N1+N0) * np.transpose(params['theta'] * params['theta']))))) 
+        Q = Q1 + Q2 + Q3 + Q4
+
+        return Q/N, Q1/N, Q2/N, Q3/N, Q4/N
+
+    def normal_1d(mu, pres, x):
+        """ Unidimensional normal with mu mean value and sigma the dispersion """
+        """ All three elements must be floats """
+        
+        lognormal = np.log(np.sqrt(abs(pres)) / np.sqrt(2 * np.pi)) - pres/2 * (x - mu) **2
+
+        return lognormal
+
+    def normal_kd(theta_list, pres_list, x_list):
+        """ Multivariate normal of dimension k, the lenght of x  """
+        """ The theta is the vector of mean values while sigma is the precision matrix """
+        """ All three elements must be lists, the sigma is a list containing the elements in the diagonal, only diagonal allowed """
+        x = np.asarray(x_list)
+        theta = np.asarray(theta_list)
+        diag_array = np.asarray(pres_list)
+        pres = np.diag(diag_array)
+        k = len(x)
+        dif = np.subtract(x, theta)    
+        lognormal = np.log(np.sqrt(abs(np.linalg.det(pres))) / np.sqrt( (2 * np.pi) **k)) -1/2 * (np.matmul(dif, np.matmul(pres, dif))) 
+
+        return lognormal
+
+    def ink(k, xn, sn, ln, params):
+
+        wk = params['w'][k]
+        thetak = params['theta'][k]
+        phik = params['phii'][k]
+        muTk = params['muT'][k]
+        muNk = params['muN'][k]
+        lambk = params['lambi'][k]
+
+        N1 = normal_kd(thetak, phik, xn)
+        N2 = normal_1d(muTk, float(lambk), sn)
+        N3 = normal_1d(muNk, float(lambk), sn)
+
+        logi = np.log(wk) + N1 + ln *N2 + (1-ln) * N3
+
+        return logi
+
+    def zeta(i_nk):
+
+        n = len(i_nk)
+        k = len(i_nk[0])
+        z_nk = np.zeros((n,k))
+
+
+        for nn in range(n):
+            i_sum = np.log(sum(np.exp(i_nk[nn])))
+        
+            z_nk[nn] = np.exp(i_nk[nn] - i_sum)
+
+        return z_nk
+
+    def accumulated_params(z, l, s, x):
+
+        n = len(z)
+        k = len(z[0])
+        auxn1 = np.zeros((n,k))
+        auxn0 = np.zeros((n,k))
+        auxr1 = np.zeros((n,k))
+        auxr0 = np.zeros((n,k))
+        auxr = np.zeros((n,k))
+
+        for nn in range(n):
+            auxn1[nn] = z[nn] * l[nn]
+            auxn0[nn] = z[nn] * (1 - l[nn])
+            auxr1[nn] = z[nn] * l[nn] * s[nn]
+            auxr0[nn] = z[nn] * (1 - l[nn]) * s[nn]
+            auxr[nn] = z[nn] * s[nn] * s[nn]
+
+        nx = len(x[0])
+        auxrx = np.zeros((k,nx))
+
+        for kk in range(k):
+            count = np.zeros(nx)
+            for nn in range(n):
+                count = count + z[nn,kk]*x[nn]
+            auxrx[kk] = count
+
+        auxrxx = np.zeros((k,nx))
+
+        for kk in range(k):
+            count2 = np.zeros(nx)
+            for nn in range(n):
+                #print(cuenta, z[nn,kk]*x[nn])
+                count2 = count2 + z[nn,kk]*x[nn]*x[nn]
+            auxrxx[kk] = count2
+
+
+        N1 = np.sum(auxn1,axis=0) 
+        N0 = np.sum(auxn0,axis=0)
+        r1 = np.sum(auxr1,axis=0) 
+        r0 = np.sum(auxr0,axis=0) 
+        r = np.sum(auxr,axis=0) 
+        rx = auxrx 
+        rxx = auxrxx
+
+        return N1, N0, r1, r0, r, rx, rxx
+
+
+    def param_update(params, N1, N0, r1, r0, r, rx, rxx, kappa=0):
+
+        k = len(N1)
+        n = len(params['theta'][0])
+        muT = np.zeros((k))
+        muN = np.zeros((k))
+        lambi = np.zeros((k))
+        theta = np.zeros((k,n))
+        phii = np.zeros((k,n))
+        rho = sum(N1) / sum(N1+N0)
+        w = (N1+N0) / sum(N1+N0)
+        
+        for kk in range(k):
+            muT[kk] = r1[kk] / N1[kk]
+            muN[kk] = r0[kk] / N0[kk]
+            lambi[kk] = (N1[kk] + N0[kk]) / (r[kk] -2* r1[kk] * params['muT'][kk] -2* r0[kk] * params['muN'][kk]+ N1[kk] * params['muT'][kk] * params['muT'][kk] + N0[kk] * params['muN'][kk] * params['muN'][kk])
+            theta[kk] = rx[kk] / (N1[kk] + N0[kk] + kappa)
+            phii[kk] = np.divide((N1[kk] + N0[kk]) * np.ones(n), rxx[kk] - 2 * rx[kk] * params['theta'][kk] + (N1[kk] + N0[kk])*  (params['theta'][kk] * params['theta'][kk]))
+
+        return {'rho': rho, 'w': w, 'muT': muT, 'muN': muN, 'lambi': lambi, 'theta': theta, 'phii': phii}
+
+    # Initial values
+    params = {}
+    dim_emb = embeddings_test.shape[1]
+    params['nx'] = 2 * dim_emb
+    params['w'] = np.random.uniform(0,1,k)
+    params['muT'] = np.ones(k)
+    params['muN'] = np.ones(k) * -1
+    params['lambi'] = np.ones(k) * 0.01
+    params['rho'] = ptar
+    phi_n = np.ones(params['nx']) * 0.0003
+    params['phii'] = np.repeat([phi_n], k, axis=0)
+    theta_Sigma = np.diag(np.ones(params['nx'])*0.01)
+    theta_mu = np.zeros(params['nx']) 
+    params['theta'] = np.random.multivariate_normal(theta_mu, theta_Sigma, size=k)
+
+    # The training code, for now, takes a list of scores, and a list of concatenated embeddings
+    # We should eventually change it to work like the calibrate method which accepts a matrix of
+    # scores and the embedding for each side of the trial separately (assuming the phi matrix is diagonal)
+
+    valid_scores = mask!=0
+    flat_scores = scores[valid_scores]
+    # Labels need to be 0 for impostors, 1 for targets, while the mask uses -1 and 1
+    labels = (mask[valid_scores] + 1)/2
+
+    num_samples = len(labels)
+
+    shape_t = embeddings_test.shape
+    shape_e = embeddings_enroll.shape
+#    e = embeddings_enroll.unsqueeze(1).expand([-1, embeddings_test.shape[0], -1])
+#    t = embeddings_test.unsqueeze(0).expand([embeddings_enroll.shape[0], -1, -1])
+    target_shape = [shape_e[0], shape_t[0], shape_e[1]]
+    e = np.broadcast_to(embeddings_enroll[:,None,:], target_shape)
+    t = np.broadcast_to(embeddings_test[None,:,:],   target_shape)
+    concat_embeddings = np.concatenate([e, t], 2)[valid_scores]
+
+    for j in range(num_it):
+        
+        # This double for loop should be done as a single matrix operation
+        i_array = np.zeros((num_samples,k))
+        for nn in range(num_samples):
+            for kk in range(k):
+                i_array[nn,kk] = ink(kk, concat_embeddings[nn], flat_scores[nn], labels[nn], params)
+                            
+        zetank = zeta(i_array)
+
+        N1, N0, r1, r0, r, rx, rxx = accumulated_params(zetank, labels, flat_scores, concat_embeddings)
+
+        params = param_update(params, N1, N0, r1, r0, r, rx, rxx)
+
+        Q, q1, q2, q3, q4 = Q_func(params, N1, N0, r1, r0, r, rx, rxx, num_samples, dim_emb)
+        print('GCA iteracion %d, Q = %f'%(j, Q))
+
+    # Keep only the first num_dim for theta y phii since for scoring we now apply the normal for enrollment
+    # and test embeddings separately (and there is no reason to believe the transform should be different
+    # for enrollment and test sides since scoring is symmetric).
+    params['phii']  = params['phii'][:,0:dim_emb].T
+    params['theta'] = params['theta'][:,0:dim_emb].T
+
+    return np.log(params['w']), params['theta'], params['phii'], params['muT'], params['muN'], params['lambi']
+
+
+
 def compute_stats(x, class_ids, class_weights, sample_weights):
     # Zeroth, first and second order stats per class, considering that
     # each class is weighted by the provided weights
@@ -176,6 +384,8 @@ def compute_lda_model(x, class_ids, weights):
     return BCov, WCov, GCov, mu.squeeze(), muc, stats
 
 
+
+### Utilities for HT-PLDA model training
 
 class RGSDict(dict):
     """
@@ -384,6 +594,5 @@ def KLgamma(nu,D,d,lambdahat):
     kl = (gammaln(a0) - gammaln(a) + a0*np.log(b/b0) + psi(a)*(a-a0) + a*(b0-b)/b).sum()
     
     return kl
-
 
 
