@@ -5,6 +5,7 @@ import numpy as np
 import h5py
 from dca_plda import utils
 from numpy.lib import recfunctions as rfn
+import re
 
 class LabelledDataset(Dataset):
     """Face Landmarks dataset."""
@@ -92,9 +93,17 @@ class LabelledDataset(Dataset):
 
         self.meta = utils.AttrDict(self.meta)
 
-        # Subset the embeddings to only those in the metadata file
+        # Subset the embeddings to only those in the metadata file.
+        # Consider here that the metadata file might have sample_ids that correspond to the same embedding.
+        # This is done just to simplify the code when the same sample belongs to more than one domain. In that case, the
+        # metadata file could include two lines like:
+        # VOX2id00553-VOX2-3xov7zPP5aA    VOX2id00553 VOX2id00553-VOX2-3xov7zPP5aA VOX
+        # VOX2id00553-VOX2-3xov7zPP5aA::2 VOX2id00553 VOX2id00553-VOX2-3xov7zPP5aA VOX-argentina
+        # Both samples correspond to the same embedding but will be treated as different samples when creating the batches
+        # so that within-domain trials are created for both domains.
+
         name_to_idx = dict(zip(ids_all, np.arange(len(ids_all))))
-        keep_idxs = np.array([name_to_idx.get(n, -1) for n in self.meta_raw['sample_id']])
+        keep_idxs = np.array([name_to_idx.get(re.sub('::.*','',n), -1) for n in self.meta_raw['sample_id']])
         if np.any(keep_idxs == -1):
             print("There are %d sample ids (out of %d in the metadata file %s) that are missing from the embeddings file %s"%(np.sum(keep_idxs==-1), len(self.meta_raw), meta_file, emb_file))
             if not skip_missing:
@@ -155,7 +164,8 @@ class LabelledDataset(Dataset):
 
 class TrialLoader(object):
 
-    def __init__(self, dataset, metadata, metamaps, device, batch_size=256, num_batches=10, balance_method='same_num_classes_per_dom_then_same_num_samples_per_class', seed=0, num_samples_per_class=2, check_count_per_sess=True):
+    def __init__(self, dataset, metadata, metamaps, device, batch_size=256, num_batches=10, balance_method='same_num_classes_per_dom_then_same_num_samples_per_class',
+                 seed=0, num_samples_per_class=2, check_count_per_sess=True, domain_weights=None):
         """
         Args:
             embeddings: list of embeddings, size NxD, where N is the number of samples and D is the embedding dimension
@@ -169,8 +179,10 @@ class TrialLoader(object):
                 same_num_samples_per_class or none: each batch is composed of the same number of samples for each class
                         The number of samples for each class is determined by num_samples_per_class.
                 same_num_classes_per_dom_then_same_num_samples_per_class: for each domain, the same number of classes
-                        appear in each batch. For each class, the same number of samples are selected (as indicated by
-                        num_samples_per_class)
+                        appear in each batch unless domain_weights in the dataset class is not None. In that case, for 
+                        each domain, choose the number of classes using the provided weights (larger weight
+                        means more classes are selected for that domain). Then, for each class, the same number of 
+                        samples are selected (as indicated by num_samples_per_class).
                 same_num_samples_per_class_and_dom: each batch is composed of the same number of samples for each class
                         and domain. Classes that appear in several domains, are overrepresented.
                 same_num_samples_per_class_then_same_num_samples_per_dom: each batch is composed of the same number of
@@ -207,7 +219,7 @@ class TrialLoader(object):
         
         # The following dictionaries are made to expedite the generation of batches
         self.classes_for_dom,            self.classi  = self._init_index_and_list([dom_col], 'class_id')
-        self.sessions_for_class_dom,     self.sessi   = self._init_index_and_list(['class_id',dom_col], 'session_id', min_len=2 if check_count_per_sess else 1)
+        self.sessions_for_class_dom,     self.sessi   = self._init_index_and_list(['class_id',dom_col], 'session_id', min_len=num_samples_per_class if check_count_per_sess else 1)
         self.samples_for_sess_class_dom, self.samplei = self._init_index_and_list(['session_id','class_id',dom_col], 'sample_id')
         self.doms_for_classes,           self.domi    = self._init_index_and_list(['class_id'], dom_col)
 
@@ -242,8 +254,12 @@ class TrialLoader(object):
                 # the domain has been set to a dummy value, so this still applies.
                 self.sel_num_samples_per_class[dom] = num_samples_per_class
                 sel_num_classes_per_batch = int(batch_size/num_samples_per_class)
-                self.sel_num_classes_per_dom[dom] = int(np.ceil(sel_num_classes_per_batch/len(self.domains)))
+                if domain_weights is not None:
+                    self.sel_num_classes_per_dom[dom] = int(np.ceil(sel_num_classes_per_batch*domain_weights[dom_name]/np.sum(list(domain_weights.values()))))
+                else:                        
+                    self.sel_num_classes_per_dom[dom] = int(np.ceil(sel_num_classes_per_batch/len(self.domains)))
                 print("Selecting %d classes for domain %s, and %d samples per selected class"%(self.sel_num_classes_per_dom[dom], dom_name, self.sel_num_samples_per_class[dom]))
+
             else:
                 raise Exception("Balance method %s not implemented"%balance_method)
 
