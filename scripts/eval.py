@@ -19,8 +19,9 @@ parser.add_argument('--ptar',     help='Prior for Cllr and DCF computation if ke
 parser.add_argument('--set',      help='Name for the set, to be used in the results file.', default=None)
 parser.add_argument('--raw',      help='Output the raw scores, before the calibration stages (used for analysis).', default=False, action='store_true')
 parser.add_argument('--level',    help='Which LLRs to return for hierarchical DCA-PLDA: None (LLRs for the classes), level1 (LLRs for clusters), level2 (LLRs for clusters conditioned on known cluster).', default=None)
-parser.add_argument('--cluster_priors', help='Only for hierarchical DCA-PLDA. A table with the detection prior for each cluster. If provided, the output LLRs will be computed using these priors instead of the default ones.', action=None)
 parser.add_argument('--fmt',      help='Format of output scores: h5 or ascii.', default='h5')
+parser.add_argument('--cluster_priors', help='Only for hierarchical DCA-PLDA. A table with the detection prior for each cluster. If provided, the output LLRs will be computed using these priors instead of the default ones.', action=None)
+parser.add_argument('--mside_method', help='Method for multi-enrollment cases: score_level or embedding_level.', default='score_level')
 parser.add_argument('model',      help='Path to the model to be used for evaluation.')
 parser.add_argument('embeddings', help='Path to the npz file with development embeddings.')
 parser.add_argument('enroll_map', help='Map from enrollment ids (first column) to the ids used in the embeddings file (second column).\
@@ -54,8 +55,12 @@ else:
 tmap = IdMap.load(opt.test_map, dataset.get_ids())
     
 ###### Generate the scores
+
 cluster_prior_dict = dict(np.loadtxt(opt.cluster_priors, dtype='O', converters={1: float})) if opt.cluster_priors else None
-scores = evaluate(model, dataset, emap, tmap, min_dur=opt.min_dur, raw=opt.raw, level=opt.level, cluster_prior_dict=cluster_prior_dict)
+
+scores = evaluate(model, dataset, emap, tmap, min_dur=opt.min_dur, raw=opt.raw, level=opt.level, cluster_prior_dict=cluster_prior_dict,
+                  method_for_multi_side_enrollment=opt.mside_method)
+    
 scores.save("%s/scores.%s"%(opt.out_dir, opt.fmt), fmt=opt.fmt)
 
 if opt.keylist is not None:
