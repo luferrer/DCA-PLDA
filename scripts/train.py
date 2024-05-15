@@ -34,6 +34,7 @@ parser.add_argument('--seed',         help='Seed used for training.', default=0,
 parser.add_argument('--configs',      help='List of configuration files to load. They are loaded in order, from left to right, overwriting previous values for repeated parameters.', default=None)
 parser.add_argument('--mods',         help='List of values to overwride config parameters. Example: training.num_epochs=20,architecture.lda_dim=200', default=None)
 parser.add_argument('--init_subset',  help='Subset of the train files to be used for initialization. For default, the files in trn_metafile are used.', default=None)
+parser.add_argument('--dom_weights',  help='Weight for each domain to be used during batch creation to determine the number of samples per domain', default=None)
 parser.add_argument('--restart',      help='Restart training from last available model.', action='store_true')
 parser.add_argument('--no_dur',       help='Metadata does not include duration column.', action='store_true')
 parser.add_argument('--print_min_loss', help='Print the min loss for each dev set at each epoch.', action='store_true')
@@ -59,6 +60,7 @@ device = setup_torch_and_cuda_vars(opt.cuda)
 
 ###### Load the dataset and create the model object
 cluster_ids = get_class_to_cluster_map_from_config(config.architecture)
+dom_weights = dict([(f[0], float(f[1])) for f in [l.strip().split() for l in open(opt.dom_weights).readlines()]]) if opt.dom_weights is not None else None
 trn_dataset = LabelledDataset(opt.trn_embeddings, opt.trn_metafile, cluster_ids=cluster_ids, meta_has_dur=(not opt.no_dur))
 in_size = trn_dataset[0]['emb'].shape[0]
 
@@ -73,6 +75,6 @@ print_graph(model, trn_dataset, device, opt.out_dir)
 print("\n####################################################################################")
 print("Starting training")
 
-train(model, trn_dataset, config.training, opt.dev_table, opt.out_dir, 
-    device, opt.seed, opt.restart, opt.debug, opt.init_subset, opt.print_min_loss)
+train(model, trn_dataset, config.training, opt.dev_table, opt.out_dir, device, dom_weights,
+      opt.seed, opt.restart, opt.debug, opt.init_subset, opt.print_min_loss)
 
