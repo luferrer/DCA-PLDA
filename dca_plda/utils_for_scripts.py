@@ -43,19 +43,25 @@ def setup_torch_and_cuda_vars(use_cuda):
 def test_model(model, data_dict, model_name, ptar, loss_type, print_min_loss=False, level1_loss_weight=None):
     # Compute the loss for each of the devsets. The validation loss will be the average over all devsets
     av_loss = 0
+    weight_sum = 0
+
+    loss_type_test = loss_type 
+    if loss_type == "per_domain_cross_entropy":
+        loss_type_test = "cross_entropy"
+
     for name, info in data_dict.items():
 
         mask = info['mask']
-        scores = evaluate(model, info['dataset'], info['emap'], info['tmap'])
+        scores = evaluate(model, info['dataset'], info['emap'], info['tmap'], method_for_multi_side_enrollment='embedding_level')
         # Since the key mask was created to be aligned to the emap and tmap, the score_mat
         # is already aligned to this mask
-        loss, llrs, labels = modules.compute_loss(scores.score_mat, mask=mask, ptar=ptar, loss_type=loss_type, return_info=True)
+        loss, llrs, labels = modules.compute_loss(scores.score_mat, mask=mask, ptar=ptar, loss_type=loss_type_test, return_info=True)
 
         if level1_loss_weight:
             # Compute the loss for the inner level of the hierarchical model and add it to the loss
             mask_level1 = info['mask_level1']
             scores_level1 = evaluate(model, info['dataset'], info['emap_level1'], info['tmap'], level='level1')
-            loss_level1, _, _ = modules.compute_loss(scores_level1.score_mat, mask=mask_level1, ptar=ptar, loss_type=loss_type, return_info=True)
+            loss_level1, _, _ = modules.compute_loss(scores_level1.score_mat, mask=mask_level1, ptar=ptar, loss_type=loss_type_test, return_info=True)
             loss_level2 = loss
             if level1_loss_weight < 1.0:
                 loss = level1_loss_weight * loss_level1 + (1-level1_loss_weight) * loss_level2
@@ -66,15 +72,16 @@ def test_model(model, data_dict, model_name, ptar, loss_type, print_min_loss=Fal
             non = llrs[labels==0].detach().cpu().numpy()
             cal = calibration.logregCal(tar, non, ptar)
             min_loss = cross_entropy(cal(tar), cal(non), ptar)
-            print("%s, loss on dev set %s = %f  min = %f"%(model_name, name, loss, min_loss))
+            print("%s, loss on dev set %-30s = %.4f  min = %.4f"%(model_name, name, loss, min_loss))
         else:
             if level1_loss_weight:
-                print("%s, loss on dev set %-20s = %.4f (level1 = %.4f, level2 = %.4f)"%(model_name, name, loss, loss_level1, loss_level2))   
+                print("%s, loss on dev set %-30s = %.4f (level1 = %.4f, level2 = %.4f)"%(model_name, name, loss, loss_level1, loss_level2))   
             else:
-                print("%s, loss on dev set %-20s = %.4f"%(model_name, name, loss))
-        av_loss += loss.detach()
+                print("%s, loss on dev set %-30s = %.4f"%(model_name, name, loss))
+        av_loss += info['weight']*loss.detach()
+        weight_sum += info['weight']
 
-    av_loss /= len(data_dict)
+    av_loss /= weight_sum
     return av_loss
 
 def load_data_dict(table, device, fixed_enrollment_ids=None, map_enrollment_ids_to_level1=None, fixed_enrollment_ids_level1=None):
@@ -83,6 +90,9 @@ def load_data_dict(table, device, fixed_enrollment_ids=None, map_enrollment_ids_
         f = line.strip().split()
         name, emb, key, emapf, tmapf = f[0:5]
         dur = f[5] if len(f) > 5 else None
+        weight = f[6] if len(f) > 6 else 1
+
+        print("Loading %s (weight = %s)"%(name, weight))
         dataset = ddata.LabelledDataset(emb, dur, meta_is_dur_only=True, device=device)
         if fixed_enrollment_ids is not None:
             # Enrollment embeddings are part of the model, not provided in the data
@@ -110,13 +120,16 @@ def load_data_dict(table, device, fixed_enrollment_ids=None, map_enrollment_ids_
             mask_level1 = None
             emap_level1 = None
         
+        if name in data_dict:
+            raise Exception("Two lines in the dev table have identical name. Please use unique identifiers for the datasets.")
+
         data_dict[name] = {'dataset': dataset, 'mask': mask, 'emap': emap, 'tmap': tmap, 
-        'mask_level1': mask_level1, 'emap_level1': emap_level1}
+        'mask_level1': mask_level1, 'emap_level1': emap_level1, 'weight': float(weight)}
 
     return data_dict
 
 
-def train(model, trn_dataset, config, dev_table, out_dir, device, 
+def train(model, trn_dataset, config, dev_table, out_dir, device, domain_weights=None,
     seed=0, restart=False, debug=False, init_subset=None, print_min_loss=False):
 
     if hasattr(model, 'class_to_cluster_map') and config.get('level1_loss_weight') is not None:
@@ -194,7 +207,7 @@ def train(model, trn_dataset, config, dev_table, out_dir, device,
     embeddings, metadata, metamaps = trn_dataset.get_data_and_meta()
     loader = ddata.TrialLoader(embeddings, metadata, metamaps, device, seed=seed, batch_size=config.batch_size,
                                num_batches=config.num_batches_per_epoch, balance_method=config.balance_method_for_batches,
-                               num_samples_per_class=config.num_samples_per_class,
+                               num_samples_per_class=config.num_samples_per_class, domain_weights=domain_weights,
                                check_count_per_sess=config.get("check_count_per_sess", True))
 
     # Train the model
@@ -257,17 +270,55 @@ def train_epoch(model, loader, optimizer, epoch, config, debug_dir=None):
         print("Using loss weight for level 1 = %f"%level1_loss_weight)
 
     for batch_idx, (data, metadata) in enumerate(loader):
-
-        if debug_dir:
-            print_batch(batches_file, metadata, loader.metamaps, batch_idx)
         
         durs = metadata.get('duration')
-        if level1_loss_weight:
-            output, output_level1, _ = model(data, durs, all_levels=True)
-        else:
-            output = model(data, durs)
 
-        optimizer.zero_grad()
+        if model.enrollment_classes is None:
+            # In this case, the enrollment classes are determined for each batch, as in the speaker
+            # verification task. The metadata input in compute_loss is only used if the loss_type is
+            # per_domain_cross_entropy.
+
+            batch_key, emap = utils.create_scoring_masks(metadata, num_models_dict=config.get('num_models'))
+            output = model.score(data, xe=data, durt=durs, dure=durs, emap=emap)
+
+            optimizer.zero_grad()
+            loss, llrs, _ = modules.compute_loss(output, ptar=config.ptar, loss_type=config.loss, metadata=metadata,
+                                                mask=batch_key, return_info=True)
+
+        else:   
+            # In enrollment_classes is part of the model, then they are fixed and we do not need
+            # to create enrollment models for each batch.
+
+            if level1_loss_weight:
+                output, output_level1, _ = model(data, durs, all_levels=True)
+            else:
+                output = model(data, durs)
+
+            optimizer.zero_grad()
+            loss, llrs, _, batch_key = modules.compute_loss(output, metadata=metadata, ptar=config.ptar,
+                                                            loss_type=config.loss, return_info=True,
+                                                            enrollment_ids=model.enrollment_classes,
+                                                            ids_to_idxs=loader.metamaps['class_id_inv'],
+                                                            return_key=True)
+            
+            if level1_loss_weight:
+                # Compute the loss for the inner level of the hierarchical model and add it to the loss
+                loss_level1, _, _ = modules.compute_loss(output_level1, metadata=metadata, ptar=config.ptar, loss_type=config.loss, 
+                                                        return_info=True, enrollment_ids=model.level1_detector.enrollment_classes, 
+                                                        ids_to_idxs=loader.metamaps['cluster_id_inv'], class_name='cluster_id')
+                if level1_loss_weight < 1.0:
+                    loss = level1_loss_weight * loss_level1 + (1-level1_loss_weight) * loss
+                else:
+                    loss = loss_level1
+            else:
+                loss_level1 = 0.0
+
+            emap = None
+
+
+        if debug_dir:
+            utils.print_batch(batches_file, metadata, loader.metamaps, batch_idx, batch_key, emap)
+            # utils.print_batch(batches_file, metadata, loader.metamaps, batch_idx)
 
         # Make the loss proportional to the batch size so that the regularization
         # parameters can be kept the same if batch size is changed. This assumes
@@ -279,26 +330,6 @@ def train_epoch(model, loader, optimizer, epoch, config, debug_dir=None):
         # I want to do the clipping on the full gradient rather than only on the 
         # part corresponding to the loss since this seems to work better.
         # The loss_scale is there for backward compatibility with my old TF code.
-        loss, llrs, _, batch_key = modules.compute_loss(output, metadata=metadata, ptar=config.ptar,
-                                                        loss_type=config.loss, return_info=True,
-                                                        enrollment_ids=model.enrollment_classes,
-                                                        ids_to_idxs=loader.metamaps['class_id_inv'],
-                                                        return_key=True)
-        
-        if debug_dir:
-#            print_batch(batches_file, metadata, loader.metamaps, batch_idx, batch_key)
-            print_batch(batches_file, metadata, loader.metamaps, batch_idx)
-
-        if level1_loss_weight:
-            # Compute the loss for the inner level of the hierarchical model and add it to the loss
-            loss_level1, _, _ = modules.compute_loss(output_level1, metadata=metadata, ptar=config.ptar, loss_type=config.loss, 
-            return_info=True, enrollment_ids=model.level1_detector.enrollment_classes, ids_to_idxs=loader.metamaps['cluster_id_inv'], class_name='cluster_id')
-            if level1_loss_weight < 1.0:
-                loss = level1_loss_weight * loss_level1 + (1-level1_loss_weight) * loss
-            else:
-                loss = loss_level1
-        else:
-            loss_level1 = 0.0
 
         loss_scale = config.batch_size * 0.056 
         regt, regl = 0.0, 0.0
@@ -343,11 +374,16 @@ def train_epoch(model, loader, optimizer, epoch, config, debug_dir=None):
     return total_loss/total_batches
 
 
-def evaluate(model, dataset, emap, tmap, min_dur=0, raw=False, level=None, cluster_prior_dict=None):
+def evaluate(model, dataset, emap, tmap, min_dur=0, raw=False, level=None, cluster_prior_dict=None,
+    method_for_multi_side_enrollment=None):
+
     """ Evaluate the model on the embeddings corresponding to emap and tmap.
     The code assumes that tmap only has single-session test models.
-    For the multi-session enrollment models we simply 
-    create single-session trials and then average the resulting scores. 
+    For the multi-session enrollment models, there are two options:
+    *  method_for_multi_side_enrollment == "score_level": creates single-session trials and 
+       then averages the resulting scores. 
+    *  method_for_multi_side_enrollment == "embedding_level": does proper scoring when possible
+       (for GPLDA and HTPLDA) and, otherwise, averages embeddings (for Quadratic PLDA).
     """
     if len(tmap.mappings.keys()) > 1 or list(tmap.mappings.keys())[0]!=1:
         raise Exception("Scoring not implemented for multi-session test maps.")
@@ -367,106 +403,78 @@ def evaluate(model, dataset, emap, tmap, min_dur=0, raw=False, level=None, clust
         if np.any(ids!=tmap.sample_ids) or (np.any(ids!=emap.sample_ids) and model.enrollment_classes is None):
             raise Exception("The dataset is not sorted the same way as the columns in emap or tmap. Make sure emap and tmap are created using the sample_ids in the dataset object you use in evaluation.")
 
+        emap_onehot, eids = mappings_to_one_hot(emap.mappings, data.shape[0])
+        # Make sure that the enrollment ids are sorted as in the emap, else, other stuff might break.
+        # If there are no bugs this check should always pass since IdMap, which creates emap and 
+        # mappings_to_one_hot should sort the ids in the same way
+        if np.any(eids != emap.model_ids):
+            raise Exception("Something is wrong, model_ids in emap do not coincide with the model ids after scoring")
+            
         tidx = tmap.mappings[1]['map'][0]
         tids = tmap.model_ids
-        scores = []
-        eids   = []
-        for k in emap.mappings.keys():
-            emapk = emap.mappings[k]['map']
-            eidsk = emap.mappings[k]['model_ids']
-            eids += eidsk
-            scoresk = torch.zeros(len(eidsk), len(tids))  
-            for i in np.arange(k):
-                eidx = emapk[i]
-                durs_tidx = durs[tidx] if durs is not None else None
-                durs_eidx = durs[eidx] if durs is not None else None
+        durs_tidx = durs[tidx] if durs is not None else None
 
-                if model.enrollment_classes is None:
-                    
-                    scoreski = model.score(data[tidx], data[eidx], durs_tidx, durs_eidx, raw=raw)                        
-                    if durs is not None:
-                        scoreski[durs[eidx]<min_dur, :] = 0
-                        
-                else:
-                    # Enrollment embeddings are part of the model
-                    if level is not None or cluster_prior_dict is not None:
-                        scoreski_output, scoreski_level1, scoreski_level2 = model.score(data[tidx], None, durs_tidx, None, raw=raw, all_levels=True, cluster_prior_dict=cluster_prior_dict)
-                    else:
-                        scoreski_output = model.score(data[tidx], None, durs_tidx, None, raw=raw)
+        if model.enrollment_classes is None:
 
-                    if level == 'level1':
-                        scoreski = scoreski_level1[eidx]
-                    elif level == 'level2':
-                        scoreski = scoreski_level2[eidx]
-                    else:
-                        scoreski = scoreski_output[eidx]                    
-
+            if method_for_multi_side_enrollment == "score_level" or method_for_multi_side_enrollment is None:
+                scores_single_side = model.score(data[tidx], data, durs_tidx, durs)
                 if durs is not None:
-                    scoreski[:, durs[tidx]<min_dur] = 0
-                scoresk += scoreski
-            scoresk /= k
-            scores.append(scoresk)
+                    scores_single_side[durs<min_dur, :] = 0
 
-        scores = torch.cat(scores,0)
-        # Make sure that the enrollment ids are sorted as in the emap, else, other stuff might break.
-        # If there are no bugs this check should always pass.
-        if np.any(eids != emap.model_ids):
-            raise Exception("Something is wrong, model_ids in emap do not coincide with the model ids after scoring")
+                # Average scores corresponding to each enrollment model
+                scores = (emap_onehot.T @ scores_single_side) / emap_onehot.sum(0, keepdim=True).T
 
-    return Scores(eids, tids, scores)
+            elif method_for_multi_side_enrollment == "embedding_level":
+                
+                scores = model.score(data[tidx], data, durs_tidx, durs, emap=emap_onehot)
+            else:   
+                raise Exception("method_for_multi_side_enrollment %s not implemented"%method_for_multi_side_enrollment)
+                            
+        else: 
+            # Enrollment embeddings are part of the model. In this case, multi-side enrollment
+            # does not apply.
+            assert method_for_multi_side_enrollment is None
 
+            if level is not None or cluster_prior_dict is not None:
+                scores_output, scores_level1, scores_level2 = model.score(data[tidx], None, durs_tidx, None, raw=raw, all_levels=True, cluster_prior_dict=cluster_prior_dict)
+                if level == 'level1':
+                    scores = scores_level1[eidx]
+                elif level == 'level2':
+                    scores = scores_level2[eidx]
+                else:
+                    scores = scores_output[eidx]                    
+            else:
+                scores = model.score(data[tidx], None, durs_tidx, None, raw=raw)
 
-def evaluate_with_proper_scoring(model, dataset, emap, tmap, min_dur=0):
-    """ Evaluate the model on the embeddings corresponding to emap and tmap.
-    The code assumes that tmap only has single-session test models.
-    For the multi-session enrollment models, we do proper scoring. Only
-    implemented, for now, for HTPLDA.
-
-    """
-    if len(tmap.mappings.keys()) > 1 or list(tmap.mappings.keys())[0]!=1:
-        raise Exception("Scoring not implemented for multi-session test maps.")
-
-    data = dataset.get_data()
-    durs = dataset.get_durs()
-    ids  = dataset.get_ids()
-    model.eval()
-
-    assert type(model) == DCA_PLDA_Backend and type(model.plda_stage) == HTPLDA and model.enrollment_classes is None            
-
-    with torch.no_grad():
-        
-        # We assume that emap and tmap were created using the ids in the dataset, but
-        # we double check just in case.
-        if np.any(ids!=tmap.sample_ids) or (np.any(ids!=emap.sample_ids) and model.enrollment_classes is None):
-            raise Exception("The dataset is not sorted the same way as the columns in emap or tmap. Make sure emap and tmap are created using the sample_ids in the dataset object you use in evaluation.")
-
-        tidx = tmap.mappings[1]['map'][0]
-        tids = tmap.model_ids
-        scores = []
-        eids   = []
-        for k in emap.mappings.keys():
-            emapk = emap.mappings[k]['map']
-            eids += emap.mappings[k]['model_ids']
-
-            num_enroll = emapk.shape[1]
-            emapk_onehot = np.zeros((data.shape[0], num_enroll), dtype=np.float32)
-            for i in np.arange(num_enroll):
-                emapk_onehot[emapk[:,i],i] = 1
-            
-            durs_tidx = durs[tidx] if durs is not None else None
-            scoresk = model.score(data[tidx], data, durs_tidx, durs, emap=emapk_onehot)
-            
-            if durs is not None:
-                scoresk[:, durs[tidx]<min_dur] = 0
-            scores.append(scoresk)
-
-        scores = torch.cat(scores,0)
-        # Make sure that the enrollment ids are sorted as in the emap, else, other stuff might break.
-        # If there are no bugs this check should always pass.
-        if np.any(eids != emap.model_ids):
-            raise Exception("Something is wrong, model_ids in emap do not coincide with the model ids after scoring")
+        if durs is not None:
+            scores[:, durs[tidx]<min_dur] = 0
 
     return Scores(eids, tids, scores)
+
+
+def mappings_to_one_hot(mappings, num_samples):
+
+    # The map is assumed to have been created using IdMap, which saves the mappings for each
+    # number of enrollment samples into a separate dictionary containing the map and the model_ids.
+    # This function collects all that into a single vector of model_ids and a single one-hot matrix
+    # with as many rows as the num_samples, and as many columns as the total number of models in the 
+    # map.
+
+    ids = []
+    total_num_enroll = np.sum([mappingsk['map'].shape[1] for mappingsk in mappings.values()])
+    map_onehot = np.zeros((num_samples, total_num_enroll), dtype=np.float32)
+
+    j = 0
+    for k in np.sort(list(mappings.keys())):
+        mappingsk = mappings[k]
+        mapk = mappingsk['map']
+        ids += mappingsk['model_ids']
+        num_enroll = mapk.shape[1]
+        for i in np.arange(num_enroll):
+            map_onehot[mapk[:,i],i+j] = 1
+        j += num_enroll
+
+    return torch.tensor(map_onehot), ids
 
 
 def compute_sideinfo(model, dataset):
