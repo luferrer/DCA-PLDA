@@ -14,6 +14,7 @@ from numpy.linalg import cholesky as chol
 from scipy.linalg import solve_triangular
 from pathlib import Path
 from dca_plda import scores
+from itertools import groupby
 
 def save_checkpoint(model, outdir, epoch=None, trn_loss=None, dev_loss=None, optimizer=None, scheduler=None, name="model"):
     
@@ -70,22 +71,128 @@ def replace_state_dict(model, sdict):
     model.load_state_dict(state_dict)
 
 
-def create_scoring_masks(metadata, class_name='class_id'):
+def create_scoring_masks(metadata, class_name='class_id', num_models_dict=None):
+    """"
+    Create a scoring mask for batch consisting of the given metadata.
+    If num_models_dict is provided, multi-side enrollment trials are provided as requested. The dict
+    should consist of number of enrollment samples as keys and the number of models to be created 
+    for each speaker for that case. Eg: num_models_dict = {2: 5, 3: 5} will create 5 2-side models
+    and 5 3-side models for each speaker in the batch. All 1side-models are always created.
+    """
 
-    def _same_val_mat(f):
-        ids = metadata[f].unsqueeze(1)
-        return ids == ids.T
+    if num_models_dict is None:
+
+        def _same_val_mat(f):
+            ids = metadata[f].unsqueeze(1)
+            return ids == ids.T
     
-    same_cla = _same_val_mat(class_name)
-    same_dom = _same_val_mat('domain_id')
-    same_ses = _same_val_mat('session_id')
-    # Valid trials are those with same domain and different session. The other trials are not scored.
-    # While the batches are created so that all target trials come from different sessions, some of the
-    # impostor trials could be same-session in some datasets (ie, when a session involves two sides of
-    # a phone conversation). We need to discard those trials here.
-    valid = same_dom * ~same_ses
+        same_cla = _same_val_mat(class_name)
+        same_dom = _same_val_mat('domain_id')
+        same_ses = _same_val_mat('session_id')
 
-    return same_cla, valid
+        emap = None
+
+    else:
+
+        def _same_val_mat(f1, f2):
+            return f1.unsqueeze(1) == f2.unsqueeze(1).T
+
+        # First, make sure that the class_ids are sorted as expected, with N consecutive samples from
+        # each speaker. 
+        class_ids = metadata[class_name]
+        domain_ids = metadata['domain_id']
+        session_ids = metadata['session_id']
+
+        batch_size = class_ids.shape[0]
+
+        # Diagonal emap corresponding to the 1side model above with corresponding same_* matrices
+        list_emap     = [torch.eye(batch_size)]
+        list_same_cla = [_same_val_mat(class_ids, class_ids)]
+        list_same_dom = [_same_val_mat(domain_ids, domain_ids)]
+        list_same_ses = [_same_val_mat(session_ids, session_ids)]
+        key = (list_same_cla[0].clone().detach().int()*2-1) * list_same_dom[0] * ~list_same_ses[0]
+        print("Number of trials for 1-side = %d / %d"%(torch.sum(key==1), torch.sum(key==-1)))
+
+        # The number of consecutive samples per class has to be a multiple of the number of samples
+        # per class set in the config. Yet, we do not have access to that info here so we take it to
+        # be the minimum number of consecutive samples per class. In some instances, two sets of 
+        # samples from the same class may be selected consecutively, so we check that all numbers
+        # in the array are multiple of the minimum.
+        consecutive_samples_per_class = np.unique([sum(1 for e in group) for _, group in groupby(class_ids)])
+        if np.any(np.array(consecutive_samples_per_class)%np.min(consecutive_samples_per_class)!=0):
+            raise Exception("Batch does not contain equal number of consecutive samples for each class")            
+        else:
+            consecutive_samples_per_class = np.min(consecutive_samples_per_class)
+
+        num_classes = int(batch_size / consecutive_samples_per_class)
+
+        for num_sides, num_models in num_models_dict.items():
+
+            all_indices = []
+            if num_sides >= consecutive_samples_per_class:
+                raise Exception("Batch does not have enough samples per class to create %d-side models"%num_sides)
+
+            for m in np.arange(num_models):
+                # Create a list of indices indicating which samples to choose for each class
+                relative_indices = np.sort(np.random.choice(np.arange(consecutive_samples_per_class), size = num_sides, replace=False))                # Repeat those indices as many times as classes in the batch
+                indices = np.repeat(relative_indices[np.newaxis,:], num_classes, axis=0)
+                # Now add the starting index of each class
+                start_index = np.arange(0, batch_size, consecutive_samples_per_class)
+                indices += start_index[:,np.newaxis]
+                all_indices.append(indices)
+
+            all_indices = np.concatenate(all_indices)
+            emap_mside = torch.zeros([num_classes*num_models, batch_size])
+            emap_mside[np.repeat(np.atleast_2d(np.arange(emap_mside.shape[0])), num_sides,axis=0).T, all_indices] = 1
+            list_emap.append(emap_mside)
+
+            # The class is the same for all samples in a model, so we can get it from the same class
+            enroll_class_ids = class_ids[all_indices[:,0]]
+            same_cla = _same_val_mat(enroll_class_ids, class_ids)
+            list_same_cla.append(same_cla)
+
+            # The domain may be different for different samples, but in most cases it will not, so
+            # we just check against the domain of the first sample in the model
+            enroll_domain_ids = domain_ids[all_indices[:,0]]
+            same_dom = _same_val_mat(enroll_domain_ids, domain_ids)
+            list_same_dom.append(same_dom)
+
+            # Then, use the same_dom to sample some of the impostor samples so that they are not overrepresented
+            # with respect to the target samples. This is because the number of target samples will be smaller
+            # for the mside trials than for the 1side trials, but the number of impostor samples will be the same.
+            # This is undesirable. Hence, we disable some percentage of the impostor samples to keep the ratio
+            # of target to impostor samples in the mside trials the same as for the 1side trials.
+            ratio_tgt = (consecutive_samples_per_class-num_sides)/(consecutive_samples_per_class-1)
+            # Randomly turn to false that same fraction of trials
+            mask = torch.ones_like(same_dom, dtype=torch.float).uniform_(0,1) < ratio_tgt
+            # Keep all the target samples, only mask-out some of the impostor samples
+            torch.logical_or(mask, same_cla, out=mask)
+            torch.logical_and(same_dom, mask, out=same_dom)
+
+            # Finally, we do need to check that all the sessions included in a model are different
+            # from the test session. 
+            same_ses = torch.zeros_like(same_cla, dtype=torch.bool)
+            for i in np.arange(num_sides):
+                enroll_sess_ids_i = session_ids[all_indices[:,i]]
+                same_ses_i = _same_val_mat(enroll_sess_ids_i, session_ids)
+                torch.logical_or(same_ses, same_ses_i, out=same_ses)
+            list_same_ses.append(same_ses)
+
+            # Temp code to check the number of trials of each kind for each num_sides
+            valid = same_dom * ~same_ses
+            key = (same_cla.clone().detach().int()*2-1)*valid
+            print("Number of trials for %d-sides = %d / %d"%(num_sides, torch.sum(key==1), torch.sum(key==-1)))
+
+        emap = torch.cat(list_emap).T
+        same_cla = torch.cat(list_same_cla)
+        same_dom = torch.cat(list_same_dom)
+        same_ses = torch.cat(list_same_ses)
+
+    # Valid trials are those with same domain and different session. The other trials are not scored.
+    valid = same_dom * ~same_ses
+    key = (same_cla.clone().detach().int()*2-1)*valid
+
+    return key, emap
 
 
 def load_config(configfile, default_config):
@@ -414,7 +521,7 @@ def get_class_to_cluster_map_from_config(config):
     return class_to_cluster_map
 
 
-def print_batch(outf, metadata, maps, batch_num, key=None):
+def print_batch(outf, metadata, maps, batch_num, key=None, emap=None):
 
     metadata_str = dict()
     for k in metadata.keys():
@@ -428,6 +535,16 @@ def print_batch(outf, metadata, maps, batch_num, key=None):
 
     if key is not None:
         ids = metadata_str['sample_id'][0]
-        scores.Key(ids, ids, key.detach().cpu().numpy()).save("%s.%d"%(outf.name,batch_num), 'ascii')
-
+        if emap is not None:
+            enroll_ids = ["%s_model%s"%(f[0], f[1]) for f in np.c_[metadata_str['class_id'][0][np.array([np.where(line==1)[0][0] for line in emap.T])], np.arange(0,emap.shape[1])]]
+            scores.Key(enroll_ids, ids, key.detach().cpu().numpy()).save("%s.%d"%(outf.name,batch_num), 'ascii')
+            emapf = open("%s.%d.emap"%(outf.name,batch_num),'w')
+            for i, m in enumerate(emap.T):
+                for j in np.where(m==1)[0]:
+                    emapf.write("%s %s\n"%(enroll_ids[i], ids[j]))
+            emapf.close()
+        else:
+            ids = metadata_str['sample_id'][0]
+            scores.Key(ids, ids, key.detach().cpu().numpy()).save("%s.%d"%(outf.name,batch_num), 'ascii')
+                            
                                                                                         
