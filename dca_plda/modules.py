@@ -13,40 +13,23 @@ from dca_plda import calibration
 from dca_plda import htplda
 from dca_plda import generative
 
-def compute_loss(llrs, metadata=None, ptar=0.01, mask=None, loss_type='cross_entropy', return_info=False, 
-                 enrollment_ids=None, ids_to_idxs=None, class_name='class_id', return_key=False):
 
-    if metadata is None:
-        assert mask is not None
-        # The mask is assumed to have been generated using the Key class, 
-        # so targets are labeled with 1, impostors with -1 and non-scored trials with 0.
-        valid = mask != 0
-        same_class = mask == 1
-    else:
-        if enrollment_ids is None:
-            # The llrs are assumed to correspond to all vs all trials
-            same_class, valid = utils.create_scoring_masks(metadata, class_name)
-        else:
-            # The llrs are assumed to correspond to all samples. The class ids in this case are
-            # indices that have to be mapped to enrollment indexes. 
-            class_ids = metadata[class_name].type(torch.int)
-            same_class = utils.onehot_for_class_ids(class_ids, enrollment_ids, ids_to_idxs).T
-            # All samples are valid. 
-            valid = torch.ones_like(llrs).type(torch.bool)
+def get_labels_logits_and_weights(llrs, same_class, valid, loss_type, ptar):
+
+    ptart = torch.as_tensor(ptar)
 
     # Select the valid llrs and shift them to convert them to logits
-    llrs   = llrs[valid]
+    llrs = llrs[valid]
     logits = llrs + logit(ptar)
     labels = same_class[valid]
     labels = labels.type(logits.type())
 
-    ptart = torch.as_tensor(ptar)
     tarw = (labels == 1).float()
     impw = (labels == 0).float()
 
 #    print("Num tar %d, num imp %d"%(tarw.sum(), impw.sum()))
     
-    if "weighted" in loss_type:
+    if loss_type == "weighted_cross_entropy" or loss_type == "weighted_brier":
         # Weights determined so that positive and negative samples are also balanced within each detector
         tar_count_per_detector = torch.sum(same_class, axis=1, keepdim=True).float()
         imp_count_per_detector = same_class.shape[1] - tar_count_per_detector
@@ -57,23 +40,59 @@ def compute_loss(llrs, metadata=None, ptar=0.01, mask=None, loss_type='cross_ent
     tar_weight = tarw *    ptart /torch.sum(tarw) if torch.sum(tarw)>0 else 0.0
     imp_weight = impw * (1-ptart)/torch.sum(impw) if torch.sum(impw)>0 else 0.0
 
-    # Finally, compute the loss and multiply it by the weight that corresponds to the impostors
-    # Loss types are taken from Niko Brummer's paper: "Likelihood-ratio calibration using prior-weighted proper scoring rules"
-    if loss_type == "cross_entropy" or loss_type == "weighted_cross_entropy":
-        baseline_loss = -ptar*np.log(ptar) - (1-ptar)*np.log(1-ptar)
-#        criterion = nn.BCEWithLogitsLoss(pos_weight=tar_weight/imp_weight, reduction='sum')
-#        loss = criterion(logits, labels)*imp_weight/baseline_loss
-        criterion = nn.BCEWithLogitsLoss(reduction='none')
-        losses = criterion(logits, labels)
-        loss = torch.sum(tar_weight*losses + imp_weight*losses)/baseline_loss
+    return logits, labels, tar_weight, imp_weight 
 
-    elif loss_type == "brier" or loss_type == "weighted_brier":
-        baseline_loss = ptar * (1-ptar)**2 + (1-ptar) * ptar**2
-        posteriors = torch.sigmoid(logits)
-        loss = torch.sum(tar_weight*(1-posteriors)**2 + imp_weight*posteriors**2)/baseline_loss
 
+def compute_loss(llrs, metadata=None, ptar=0.01, mask=None, loss_type='cross_entropy', return_info=False, 
+                 enrollment_ids=None, ids_to_idxs=None, class_name='class_id', return_key=False):
+
+    if mask is not None:
+        # The mask is assumed to have been generated using the Key class, 
+        # so targets are labeled with 1, impostors with -1 and non-scored trials with 0.
+        valid = mask != 0
+        same_class = mask == 1
     else:
-        raise Exception("Unknown loss_type %s"%loss_type)
+        # The llrs are assumed to correspond to all samples. The class ids in this case are
+        # indices that have to be mapped to enrollment indexes. 
+        class_ids = metadata[class_name].type(torch.int)
+        same_class = utils.onehot_for_class_ids(class_ids, enrollment_ids, ids_to_idxs).T
+        # All samples are valid. 
+        valid = torch.ones_like(llrs).type(torch.bool)
+
+    if loss_type == "per_domain_cross_entropy":
+        # Compute the tarw and impw separately for each domain and then sum across domains
+        criterion = nn.BCEWithLogitsLoss(reduction='none')
+        baseline_loss = -ptar*np.log(ptar) - (1-ptar)*np.log(1-ptar)
+        loss = 0
+        total_tar = 0
+        for dom in torch.unique(metadata['domain_id']):
+            idxs = metadata['domain_id'] == dom
+            logits, labels, tar_weight, imp_weight = get_labels_logits_and_weights(llrs[:,idxs], same_class[:,idxs], valid[:,idxs], loss_type, ptar)
+            losses = criterion(logits, labels)
+            num_tar = torch.sum(labels==1)
+            loss += torch.sum(tar_weight*losses + imp_weight*losses) * num_tar
+            total_tar += num_tar
+
+        loss /= baseline_loss * total_tar
+    else:
+
+        logits, labels, tar_weight, imp_weight = get_labels_logits_and_weights(llrs, same_class, valid, loss_type, ptar)
+
+        # Finally, compute the loss and multiply it by the weight that corresponds to the impostors
+        # Loss types are taken from Niko Brummer's paper: "Likelihood-ratio calibration using prior-weighted proper scoring rules"
+        if loss_type == "cross_entropy" or loss_type == "weighted_cross_entropy":
+            baseline_loss = -ptar*np.log(ptar) - (1-ptar)*np.log(1-ptar)
+            criterion = nn.BCEWithLogitsLoss(reduction='none')
+            losses = criterion(logits, labels)
+            loss = torch.sum(tar_weight*losses + imp_weight*losses)/baseline_loss
+
+        elif loss_type == "brier" or loss_type == "weighted_brier":
+            baseline_loss = ptar * (1-ptar)**2 + (1-ptar) * ptar**2
+            posteriors = torch.sigmoid(logits)
+            loss = torch.sum(tar_weight*(1-posteriors)**2 + imp_weight*posteriors**2)/baseline_loss
+
+        else:
+            raise Exception("Unknown loss_type %s"%loss_type)
 
     if return_info:
         if return_key:
@@ -124,6 +143,10 @@ class DCA_PLDA_Backend(nn.Module):
             # Allow L to be assymetric after discriminative training
             self.plda_stage = Quadratic(lda_dim, non_symmetric_L=True)
         
+        elif plda_type == 'gaussian_plda':
+            # In this case, the PLDA stage is given by the standard Gaussian PLDA form. 
+            self.plda_stage = GPLDA(lda_dim)
+
         elif plda_type == 'heavy_tailed_plda':
             # In this case, the PLDA stage is given by the HT-PLDA formulation and uses the parameters
             # of the generative model: F and Cw. Hence, after discriminative training, we can still
@@ -156,9 +179,11 @@ class DCA_PLDA_Backend(nn.Module):
             self.enrollment_classes = None
             self.enrollment = None
 
-        if config.get('sideinfo_parameters'):
+        cal_params = config.get('calibration_parameters')
+
+        if cal_params is not None and cal_params.get('sideinfo_dependent'):
             idim = config.sideinfo_parameters.get('internal_dim', 200)
-            edim = config.sideinfo_parameters.get('external_dim', 5)
+            edim = config.sideinfo_parameters.get('external_dim', None)
 
             self.si_input = config.sideinfo_parameters.get('input_from','main_input') 
             if self.si_input == 'main_input':
@@ -169,38 +194,81 @@ class DCA_PLDA_Backend(nn.Module):
                 raise Exception("Unrecognized input for sideinfo branch")
 
             self.si_stage1 = Affine(si_in_dim, idim, "l2norm")
+            self.si_dim = idim
 
-            stage2_activation = config.sideinfo_parameters.get('stage2_activation', 'logsoftmax')
-            if config.sideinfo_parameters.get('stage2_inner_sizes'):
-                # Pass the output of the first stage through a simple NN
-                self.si_stage2 = SimpleNN(idim, edim, stage2_activation, config.sideinfo_parameters.get('stage2_inner_sizes'), config.sideinfo_parameters.get('stage2_inner_activation'))
-            else:
-                self.si_stage2 = Affine(idim, edim, stage2_activation)
+            if edim is not None:
+                stage2_activation = config.sideinfo_parameters.get('stage2_activation', 'logsoftmax')
+                if config.sideinfo_parameters.get('stage2_inner_sizes'):
+                    # Pass the output of the first stage through a simple NN
+                    self.si_stage2 = SimpleNN(idim, edim, stage2_activation, config.sideinfo_parameters.get('stage2_inner_sizes'), config.sideinfo_parameters.get('stage2_inner_activation'))
+                else:
+                    self.si_stage2 = Affine(idim, edim, stage2_activation)
+                self.si_dim = edim
         else:
             config.sideinfo_parameters = None
-            edim = 0
+            self.si_dim = 0
 
-        self.si_dim = edim
+        if cal_params is not None and cal_params.get('duration_dependent'):
+
+            if config.get('duration_parameters'):
+                # Newer way to specify these parameters, since the duration transform is no longer
+                # part of CA_Calibrator
+                dur_config = config.get('duration_parameters')
+            else:
+                # For backward compatibility with old configs
+                dur_config = config.get('calibration_parameters')
+
+            self.dur_stage = FeaturesFromScalar(dur_config)
+            self.dur_dim = self.dur_stage.dim
+
+        else:
+            self.dur_dim = 0
+
+
+        if cal_params is not None and cal_params.get('numside_dependent'):
+
+            self.numside_stage = FeaturesFromScalar(config.get('numside_parameters'))
+            self.numside_dim = self.numside_stage.dim
+
+        else:
+            self.numside_dim = 0
+
 
         if config.get('si_dependent_shift_parameters'):
             assert self.si_dim > 0
             # The shift selector is just a W matrix
             self.shift_selector = Affine(self.si_dim, lda_dim, activation=None, bias=False) 
 
-        self.cal_stage  = CA_Calibrator(config.get('calibration_parameters'), si_dim=self.si_dim)
+        self.cal_stage  = CA_Calibrator(config.get('calibration_parameters'), si_dim=self.si_dim, 
+                                        dur_dim=self.dur_dim, ns_dim=self.numside_dim)
+
 
     def forward(self, x, durations=None):
         # The forward method assumes the same enroll and test data. This is used in training.
         return self.score(x, durt=durations)
+
+    def process_si(self, x, x2, emap=None):
+                     
+        si_input = x if self.si_input == 'main_input' else x2
+        s2 = self.si_stage1(si_input) 
+
+        if emap is not None:
+            # Average the embeddings before the final transformation
+            s2 = average_embeddings_over_sides(emap, s2)
+
+        # Finally, compute the side-info embeddings
+        if hasattr(self, 'si_stage2'):
+            si = self.si_stage2(s2)
+        else:
+            si = s2
+
+        return si
 
     def score(self, xt, xe=None, durt=None, dure=None, si_only=False, raw=False, subset_enrollment_idxs=None, emap=None):
         # Same as the forward method but it allows for asymmetric scoring where the rows and columns
         # of the resulting score file corresponds to two different sets of data.
         # It also allows for an enrollment map which can be used for proper scoring for multi-enrollment cases.
         # This option, though, does not yet work when using duration or side information branches.
-
-        if emap is not None and (self.cal_stage.is_sidep or self.cal_stage.is_durdep):
-            raise Exception("Proper scoring not yet implemented when using a side-information- or duration-dependent calibration")
             
         hase = xe is not None
 
@@ -217,17 +285,32 @@ class DCA_PLDA_Backend(nn.Module):
 
         if hasattr(self,'si_stage1'):
 
-            si_inpute = xe if self.si_input == 'main_input' else x2e
-            si_inputt = xt if self.si_input == 'main_input' else x2t
+            sie = self.process_si(xe, x2e, emap) if hase else None
+            sit = self.process_si(xt, x2t)
              
-            s2e = self.si_stage1(si_inpute) if hase else None
-            s2t = self.si_stage1(si_inputt) 
-
-            sie = self.si_stage2(s2e) if hase else None
-            sit = self.si_stage2(s2t) 
-
         else:
             sie = sit = None
+
+        if hasattr(self, 'dur_stage'):
+            # Compute duration features
+            dfe = self.dur_stage(dure) if hase else None
+            dft = self.dur_stage(durt)
+
+            if emap is not None and hase is not None:
+                # Average the duration features
+                dfe = average_embeddings_over_sides(emap, dfe)
+        else:
+            dfe = dft = None
+
+        if emap is not None:
+            nse = torch.sum(emap, axis=0)
+        else:
+            nse = torch.ones(xe.shape[0]) if hase else torch.ones(xt.shape[0])
+
+        if hasattr(self, 'numside_stage'):
+            nsfe = self.numside_stage(nse) 
+        else:
+            nsfe = None
 
         if si_only:
             assert xe is None and sit is not None
@@ -248,14 +331,15 @@ class DCA_PLDA_Backend(nn.Module):
                 if self.enrollment_before_lda:
                     enrollment_M = self.lda_stage(enrollment_M)
                 scrs = self.plda_stage.score_with_stats(x2t, enrollment_M, self.enrollment.N)
+
                 # In this case, there is no dur or si for the enrollment side. 
                 # Set them to a vector of constants 
-                dure = torch.ones(scrs.shape[0]).to(scrs.device) if durt is not None else None
-                sie  = torch.ones([scrs.shape[0], sit.shape[1]]).to(scrs.device) if sit is not None else None
+                dfe = torch.ones(scrs.shape[0], dft.shape[1]).to(scrs.device) if dft is not None else None
+                sfe = torch.ones(scrs.shape[0], sit.shape[1]).to(scrs.device) if sit is not None else None
             else:
                 scrs = self.plda_stage.score(x2t, x2e, emap)
 
-            llrs = self.cal_stage.calibrate(scrs, durt, sit, dure, sie)            
+            llrs = self.cal_stage.calibrate(scrs, dft, sit, dfe, sie, nsfe)            
             return llrs if raw is False else scrs
 
 
@@ -318,7 +402,7 @@ class DCA_PLDA_Backend(nn.Module):
 
                 s2 = self.si_stage1(si_input)
                     
-                if 'si' in init_components:
+                if 'si' in init_components and hasattr(self, 'si_stage2'):
                     if init_params.get('init_si_stage2_with_domain_gb', False):
                         # Initialize the second stage of the si-extractor to be a gaussian backend that predicts
                         # the posterior of each domain. In this case, the number of domains has to coincide with the
@@ -332,7 +416,7 @@ class DCA_PLDA_Backend(nn.Module):
 
                 if hasattr(self,'shift_selector'):
                     # Initialize the shifts as the mean of the lda outputs weighted by the si
-                    si = self.si_stage2(s2)
+                    si = self.process_si(x, x2)
                     if 'si' in init_components:
                         if init_params.get("random"):
                             self.shift_selector.init_random(init_params.get('stdev',0.1))
@@ -396,28 +480,29 @@ class DCA_PLDA_Backend(nn.Module):
             else:
                 scrs = self.plda_stage.score(x2)
                 # The llrs are assumed to correspond to all vs all trials
-                same_class, valid = utils.create_scoring_masks(meta_batch)
+                mask_batch, _ = utils.create_scoring_masks(meta_batch)
 
             if 'calibration' in init_components:
                 print("Initializing calibration stage")
                 if init_params.get("random"):
                     self.cal_stage.init_random(init_params.get('stdev',0.1))
                 else:
-                    scrs_np, same_class_np, valid_np = [v.detach().cpu().numpy() for v in [scrs, same_class, valid]]
-                    self.cal_stage.init_with_logreg(scrs_np, same_class_np, valid_np, trn_config.ptar, std_for_mats=init_params.get('std_for_cal_matrices',0))
+                    scrs_np, mask_batch_np = [v.detach().cpu().numpy() for v in [scrs, mask_batch]]
+                    if self.cal_stage.is_sidepg:
+                        si_emb_np = self.process_si(x, x2).detach().cpu().numpy()
+                    else:
+                        si_emb_np = None
+                    self.cal_stage.init_with_logreg(scrs_np, mask_batch_np, trn_config.ptar, std_for_mats=init_params.get('std_for_cal_matrices',0), embeddings=si_emb_np)
 
-            dummy_durs_t = torch.ones(scrs.shape[1]).to(device) 
-            dummy_durs_e = torch.ones(scrs.shape[0]).to(device) 
-            dummy_si_t = torch.zeros(scrs.shape[1], self.si_dim).to(device)
-            dummy_si_e = torch.zeros(scrs.shape[0], self.si_dim).to(device)
+            dummy_durs_t = torch.ones(scrs.shape[1], self.dur_dim).to(device) 
+            dummy_durs_e = torch.ones(scrs.shape[0], self.dur_dim).to(device) 
+            dummy_si_t   = torch.zeros(scrs.shape[1], self.si_dim).to(device)
+            dummy_si_e   = torch.zeros(scrs.shape[0], self.si_dim).to(device)
             llrs = self.cal_stage.calibrate(scrs, dummy_durs_t, dummy_si_t, dummy_durs_e, dummy_si_e)
-            mask = torch.ones_like(same_class, dtype=torch.int8)
-            mask[~same_class] = -1
-            mask[~valid] = 0
-
+            
 #            utils.print_batch(open("first_batch","w"), meta_batch, loader.metamaps, 0, mask)
 
-            return compute_loss(llrs, mask=mask, ptar=trn_config.ptar, loss_type=trn_config.loss)
+            return compute_loss(llrs, mask=mask_batch, ptar=trn_config.ptar, loss_type=trn_config.loss, metadata=meta_batch)
 
 
 
@@ -654,50 +739,62 @@ class Hierarchical_DCA_PLDA_Backend(nn.Module):
 
 
 class CA_Calibrator(nn.Module):
-    def __init__(self, config, si_dim=None):
+    def __init__(self, config, si_dim=None, dur_dim=None, ns_dim=None):
         """
         Implements the calibration stage. There are four options:
         * Plain calibration with a global alpha and beta
         * Duration-dependent calibration
         * Side-info- and duration-dependent calibration
         * Side-info-dependent calibration
+        For each of those cases, a stage that depends on the number of enrollment sides can be
+        included at the end of the pipeline.
         """
         super().__init__()
 
         self.config = config
         self.is_sidep = False
+        self.is_sidepg = False
         self.is_durdep = False
-    
-        if self.config:
-            self.dur_rep = self.config.get('duration_representation', 'log') 
-            self.dur_thresholds = self.config.get('duration_thresholds')
-            self.si_cal_first = self.config.get('si_cal_first', True) 
-            numdurf = self._process_durs(torch.ones(10), init=True).shape[1]
+        self.is_nsdep = False
 
+        if self.config:
+            self.ns_cal_first = self.config.get('ns_cal_first', True)
+            self.si_cal_first = self.config.get('si_cal_first', True) 
             self.transform_type = config.get('transform_type', 'quadratic_form')
             self.non_symmetric_L = self.transform_type == 'quadratic_form_non_symmetric_L'
 
         if self.config and self.config.get('sideinfo_dependent'):
-            self.is_sidep = True
-            use_G = config.get("use_G_for_si", True) 
-            use_L = config.get("use_L_for_si", True) 
-            use_C = config.get("use_C_for_si", True)
+            sideinfo_model_type = self.config.get('sideinfo_model','Quadratic')
             self.si_dim = si_dim
-            if self.config.get('concat_durfeats_with_sideinfo'):
-                self.si_dim += numdurf
-            self.sidep_alpha = Quadratic(self.si_dim, use_G=use_G, use_C=use_C, use_L=use_L, non_symmetric_L=self.non_symmetric_L)
-            self.sidep_beta  = Quadratic(self.si_dim, use_G=use_G, use_C=use_C, use_L=use_L, non_symmetric_L=self.non_symmetric_L)
+            if sideinfo_model_type=='Quadratic':
+                self.is_sidep = True
+                use_G = config.get("use_G_for_si", True) 
+                use_L = config.get("use_L_for_si", True) 
+                use_C = config.get("use_C_for_si", True)
+                if self.config.get('concat_durfeats_with_sideinfo'):
+                    self.si_dim += dur_dim
+                self.sidep_alpha = Quadratic(self.si_dim, use_G=use_G, use_C=use_C, use_L=use_L, non_symmetric_L=self.non_symmetric_L)
+                self.sidep_beta  = Quadratic(self.si_dim, use_G=use_G, use_C=use_C, use_L=use_L, non_symmetric_L=self.non_symmetric_L)
+            elif sideinfo_model_type == 'GCA':
+                self.is_sidepg = True
+                self.sidep_model = GCA(self.si_dim, self.config.get('gca_k'))
 
         if self.config and self.config.get('duration_dependent'):
             self.is_durdep = True
-            # Fake input to _process_durs just to get the dimension of the processed duration vector
             use_G = config.get("use_G_for_dur", True) 
             use_L = config.get("use_L_for_dur", True) 
             use_C = config.get("use_C_for_dur", True) 
-            self.durdep_alpha = Quadratic(numdurf, use_G=use_G, use_C=use_C, use_L=use_L, non_symmetric_L=self.non_symmetric_L)
-            self.durdep_beta  = Quadratic(numdurf, use_G=use_G, use_C=use_C, use_L=use_L, non_symmetric_L=self.non_symmetric_L)
-        
-        if not self.is_sidep and not self.is_durdep:
+            self.dur_dim = dur_dim
+            self.durdep_alpha = Quadratic(self.dur_dim, use_G=use_G, use_C=use_C, use_L=use_L, non_symmetric_L=self.non_symmetric_L)
+            self.durdep_beta  = Quadratic(self.dur_dim, use_G=use_G, use_C=use_C, use_L=use_L, non_symmetric_L=self.non_symmetric_L)
+
+        if self.config and self.config.get('numside_dependent'):
+            self.is_nsdep = True
+            self.ns_dim = ns_dim
+            self.nsdep_alpha = Affine(self.ns_dim, 1)
+            self.nsdep_beta  = Affine(self.ns_dim, 1)
+
+        if not self.is_sidep and not self.is_durdep and not self.is_nsdep:
             # Global calibration
             self.alpha = Parameter(torch.tensor(1.0))
             self.beta  = Parameter(torch.tensor(0.0))
@@ -707,96 +804,36 @@ class CA_Calibrator(nn.Module):
         # The forward method assumes the same enroll and test data. This is used in training.
         return self.calibrate(scores, durations, side_info)
 
-    @staticmethod
-    def _bucketize(tensor, boundaries):
-        # Can be replaced with torch.bucketize in older versions
-        result = torch.zeros_like(tensor, dtype=torch.int64)
-        for boundary in boundaries:
-            result += (tensor > boundary).int()
-        return result
 
-    def _process_durs(self, durations, init=False):
-        
-        if self.dur_rep == 'log':
-            durs = torch.log(durations.unsqueeze(1))
-
-        elif self.dur_rep == 'logpa':
-            # Logarithm with a shift initiliazed with 0
-            if init: 
-                self.logdur_shift = Parameter(torch.tensor(0.0))
-            durs = torch.log(durations.unsqueeze(1)+self.logdur_shift)
-
-        elif self.dur_rep == 'log2':
-            durs = torch.log(durations.unsqueeze(1))
-            durs = torch.cat([durs, durs*durs], 1)
-
-        elif self.dur_rep == 'idlog':
-            durs = durations.unsqueeze(1)
-            durs = torch.cat([durs/100, torch.log(durs)], 1)
-
-        elif self.dur_rep == 'siglog' or self.dur_rep == 'siglogp':
-            durs = torch.log(durations.unsqueeze(1))
-            # Take the log durs and multiplied them by a sigmoid centered a some value
-            # and then again with a rotated sigmoid
-            if init:
-                scale   = self.config.get("duration_sigmoid_scale")
-                centers = np.log(self.dur_thresholds)
-                if self.dur_rep == 'siglogp':
-                    # Scale and centers are learnable parameters, initialized
-                    # with the provided value
-                    self.siglogdur_scale   = Parameter(torch.tensor(scale))
-                    self.siglogdur_centers = Parameter(torch.tensor(centers))
-                else:
-                    self.siglogdur_scale   = scale
-                    self.siglogdur_centers = centers
-
-            fs = []
-            prev_sig = 0
-            for c in self.siglogdur_centers:
-                sigf = torch.sigmoid(-self.siglogdur_scale*(durs-c)) 
-                sig = sigf - prev_sig
-                fs.append(durs*sig)
-                prev_sig = sigf
-            sig = 1-sigf
-            fs.append(durs*sig)
-            durs = torch.cat(fs, 1)
-            # Simple version for a single center. 
-            #    sig1 = torch.sigmoid(scale*(durs-center))
-            #sig2 = 1.0-sig1
-            #durs = torch.cat([durs*sig1, durs*sig2], 1)
-
-        else:
-            durs_disc = self._bucketize(durations, self.dur_thresholds)
-            durs_onehot = nn.functional.one_hot(durs_disc, num_classes=len(self.dur_thresholds)+1).type(torch.get_default_dtype())
-            if self.dur_rep == 'pwlog':
-                durs = torch.log(durations.unsqueeze(1)) * durs_onehot
-            elif self.dur_rep == 'discrete':            
-                durs = durs_onehot
-            else:
-                raise Exception("Duration representation %s not implemented"%self.dur_rep)
-
-        return durs
-
-    def calibrate(self, scores, durations_test=None, side_info_test=None, durations_enroll=None, side_info_enroll=None):
+    def calibrate(self, scores, durations_test=None, side_info_test=None, durations_enroll=None, 
+                  side_info_enroll=None, numsides_enroll=None):
+            
+        if self.is_nsdep:
+            if numsides_enroll is None:
+                numsides_enroll = torch.ones([scores.shape[0], self.ns_dim])
+            # Numsides-dependent calibration
+            alpha_ns = self.nsdep_alpha(numsides_enroll)
+            beta_ns  = self.nsdep_beta(numsides_enroll)
+            if self.ns_cal_first:
+                scores = alpha_ns*scores + beta_ns
 
         if self.is_sidep:
             # Sideinfo-dep calibration, optionally with the duration appended
             if self.config.get('concat_durfeats_with_sideinfo'):
-                durs_enroll = self._process_durs(durations_enroll) if durations_enroll is not None else None
-                durs_test   = self._process_durs(durations_test) 
-                side_info_enroll = torch.cat([durs_enroll, side_info_enroll], 1) if side_info_enroll is not None else None
-                side_info_test   = torch.cat([durs_test,   side_info_test],   1) 
+                side_info_enroll = torch.cat([durations_enroll, side_info_enroll], 1) if side_info_enroll is not None else None
+                side_info_test   = torch.cat([durations_test,   side_info_test],   1) 
             alpha_si = self.sidep_alpha.score(side_info_test, side_info_enroll)
             beta_si  = self.sidep_beta.score(side_info_test, side_info_enroll)
             if self.si_cal_first:                
                 scores = alpha_si*scores + beta_si
 
+        if self.is_sidepg and self.si_cal_first:
+            scores = self.sidep_model.calibrate(scores, side_info_enroll, side_info_test)
+
         if self.is_durdep:
             # Dur-dep calibration 
-            durs_enroll = self._process_durs(durations_enroll) if durations_enroll is not None else None
-            durs_test   = self._process_durs(durations_test) 
-            alpha = self.durdep_alpha.score(durs_test, durs_enroll)
-            beta  = self.durdep_beta.score(durs_test, durs_enroll)
+            alpha = self.durdep_alpha.score(durations_test, durations_enroll)
+            beta  = self.durdep_beta.score(durations_test, durations_enroll)
 
         elif not self.is_sidep:
             # Global calibration
@@ -813,6 +850,12 @@ class CA_Calibrator(nn.Module):
         if self.is_sidep and not self.si_cal_first:
             scores = alpha_si*scores + beta_si
 
+        if self.is_sidepg and not self.si_cal_first:
+            scores = self.sidep_model.calibrate(scores, side_info_enroll, side_info_test)
+
+        if self.is_nsdep and not self.ns_cal_first:
+            scores = alpha_ns*scores + beta_ns
+
         return scores
 
 
@@ -823,22 +866,29 @@ class CA_Calibrator(nn.Module):
             self.durdep_alpha.init_random(std)
             self.durdep_beta.init_random(std)
 
-        elif not self.is_sidep:
+        elif not self.is_sidep and not self.is_sidepg:
             # Global calibration
             nn.init.normal_(self.alpha, 0.0, std)
             nn.init.normal_(self.beta,  0.0, std)
+
         else:
-            self.sidep_alpha.init_random(std)
-            self.sidep_beta.init_random(std)
+            if self.is_sidep:
+                self.sidep_alpha.init_random(std)
+                self.sidep_beta.init_random(std)
+            else:
+                self.sidep_model.init_random(std)
+
+        if self.is_nsdep:
+            self.nsdep_alpha.init_random(std)
+            self.nsdep_beta.init_random(std)
 
 
-    def init_with_logreg(self, scores, same_class, valid, ptar, std_for_mats=0):
 
-        scores = scores[valid]
-        labels = same_class[valid]
+    def init_with_logreg(self, scores, mask, ptar, std_for_mats=0, embeddings=None):
 
-        tar = scores[labels==1]
-        non = scores[labels==0]
+        labels = mask[mask!=0]
+        tar = scores[mask!=0][labels==1]
+        non = scores[mask!=0][labels==-1]
 
         a, b = calibration.logregCal(tar, non, ptar, return_params=True)
 
@@ -849,15 +899,92 @@ class CA_Calibrator(nn.Module):
             if self.is_sidep:
                 self.sidep_alpha.init_with_constant(1.0, std_for_mats)
                 self.sidep_beta.init_with_constant(0.0, std_for_mats)
+            elif self.is_sidepg:
+                self.sidep_model.init_generatively(a*scores+b, mask, embeddings, ptar=ptar)
 
-        elif not self.is_sidep:
+        elif not self.is_sidep and not self.is_sidepg:
             # Global calibration
             utils.replace_state_dict(self, {'alpha': a, 'beta': b})
 
         else:
             # Only si-dependent cal
-            self.sidep_alpha.init_with_constant(a, std_for_mats)
-            self.sidep_beta.init_with_constant(b, std_for_mats)
+            if self.is_sidep:
+                self.sidep_alpha.init_with_constant(a, std_for_mats)
+                self.sidep_beta.init_with_constant(b, std_for_mats)
+            else:
+                self.sidep_model.init_generatively(scores, embeddings)
+
+
+class GCA(nn.Module):
+    """ Implements a discriminative version of the approach proposed in Borgstrom's
+    'A Generative Approach to Condition-Aware Score Calibration for Speaker Verification'
+    """
+
+    def __init__(self, in_dim, num_cond=1):
+        super().__init__()
+        self.K     = num_cond
+        self.logw  = Parameter(torch.zeros(self.K))
+        self.theta = Parameter(torch.zeros(in_dim, self.K))
+        self.phii  = Parameter(torch.ones(in_dim, self.K)*0.0003)
+        self.muT   = Parameter(torch.ones(self.K))
+        self.muN   = Parameter(torch.ones(self.K)*-1)
+        self.lambi = Parameter(torch.ones(self.K)*0.01)
+
+    @staticmethod
+    def normal_exp(mu, prec, x):
+        # Compute the exponent of the normal distribution only (no constant, no exponentiation),
+        # assuming the precision matrix is diagonal.
+        # Use various tricks to do the computation over all dimensions k at once
+        x_cent = x.unsqueeze(2).expand(-1, -1, mu.shape[-1]) - mu
+        return -1/2 * torch.sum(x_cent * prec * x_cent, axis=1)
+
+    @staticmethod
+    def normal_exp_matrix(mu, prec, x):
+        # As normal_exp above, but x is assumed to be a matrix of scores and mu and prec a vector
+        # with one value per condition. 
+        x_cent = x.unsqueeze(-1) - mu
+        return -1/2 * x_cent**2 * prec.unsqueeze(0).unsqueeze(0)
+
+    def calibrate(self, scores, xt, xe=None):
+        # This method implements eq (23) in Borgstrom's paper
+
+        if xe is None:
+            xe = xt
+
+        # The output of normal_exp is a scalar for each vector in x
+        # The value c below ends up being a tensor of dimension Nt x Ne x K, where Nt is the size
+        # of xt, Ne is the size of xe and K is the size of theta, the number of conditions. 
+        # Note that the trick below where we sum the terms for x_t and x_e can only be done if
+        # phi is assumed diagonal so that there are no interactions between the two embeddings.
+        
+        tgt_llk = self.normal_exp_matrix(self.muT, self.lambi, scores)
+        imp_llk = self.normal_exp_matrix(self.muN, self.lambi, scores)
+        if self.theta.shape[0] > 1:
+            # c is the common part in the numerator and denominator of the llr (the w and the condition-dependent gaussians)
+            c = self.logw + self.normal_exp(self.theta, self.phii, xt).unsqueeze(1) + self.normal_exp(self.theta, self.phii, xe).unsqueeze(0)
+            llr = torch.logsumexp(tgt_llk+c,-1) - torch.logsumexp(imp_llk+c,-1)
+        else:
+            # When the number of conditions is 1, the logsumexp above does nothing and we can simply
+            # subtract the two likelihoods (c goes away and does not need to be computed)
+            llr = (tgt_llk - imp_llk).squeeze()
+        return llr
+
+    def init_random(self, std):
+        nn.init.normal_(self.logw, 0.0, std)
+        nn.init.normal_(self.theta, 0.0, std)
+        nn.init.normal_(self.phii, 0.0, std)
+        nn.init.normal_(self.muT, 1.0, std)
+        nn.init.normal_(self.muN, -1.0, std)
+        nn.init.normal_(self.lambi, 0.1, std)
+
+    def init_generatively(self, scores, mask, embeddings_test, embeddings_enroll=None, ptar=0.1):
+
+        if embeddings_enroll is None:
+            embeddings_enroll = embeddings_test
+
+        logw, theta, phii, muT, muN, lambi = generative.compute_gca_model(scores, mask, embeddings_test, embeddings_enroll, self.K, ptar=ptar)
+        state_dict = {'logw': logw, 'theta': theta, 'phii': phii, 'muT': muT, 'muN': muN, 'lambi': lambi}
+        utils.replace_state_dict(self, state_dict)
 
 
 class Quadratic(nn.Module):
@@ -876,11 +1003,12 @@ class Quadratic(nn.Module):
         return self.score(x)
 
     def score(self, xt, xe=None, emap=None):
-
-        # emap is for doing proper scoring, which we cannot do with this specific implementation of PLDA
-        # because we do not have the original PLDA parameters available.
-        assert emap is None
         
+        if emap is not None:
+            # When emap is provided, we simply average the embeddings for each enrollment model
+            # before running the model
+            xe = average_embeddings_over_sides(emap, xe)
+
         # PLDA-like computation. The output i, j is given by
         # 2 * xi^T L xj + xi^T G xi + xj^T G xj + xi^T C + xj^T C + k
         if xe is None:
@@ -932,8 +1060,7 @@ class Quadratic(nn.Module):
         nn.init.normal_(self.C, 0.0, std)
 
     def init_with_plda_trained_generatively(self, x, class_ids, init_params, domain_ids=None, sample_weights=None):
-        # Compute a PLDA model with the input data, approximating the 
-        # model with just the usual initialization without the EM iterations
+        # Compute a PLDA model with the input data
 
         weights = compute_weights(class_ids, domain_ids, init_params.get('balance_method'), sample_weights)
 
@@ -954,7 +1081,7 @@ class Quadratic(nn.Module):
         # Bi and Wi are the between and within covariance matrices and mu is the global (weighted) mean
         Bi, Wi, mu = generative.compute_2cov_plda_model(x, class_ids, weights, init_params.get('plda_em_its',0), init_ids=init_ids)
         
-        # Equations (14) and (16) in Cumani's paper 
+        # Equations (14) and (16) in Cumani's paper ("Pairwise discriminative speaker verification in the i-vector space")
         # Note that the paper has an error in the formula for k (a 1/2 missing before k_tilde) 
         # that is fixed in the equations below
         # To compute L_tild and G_tilde we use the following equality:
@@ -979,6 +1106,66 @@ class Quadratic(nn.Module):
 
         utils.replace_state_dict(self, state_dict)
 
+
+
+
+class GPLDA(nn.Module):
+
+    def __init__(self, in_dim):
+        super().__init__()
+        self.H = Parameter(torch.zeros(in_dim, in_dim)) 
+        self.F = Parameter(torch.zeros(in_dim, in_dim))
+        self.mu = Parameter(torch.zeros(in_dim,1))
+        self.nu = 1000000000000000 # A very large number to simulate GPLDA using the HTPLDA code
+        
+    def forward(self, x):
+        # The forward method assumes the same enroll and test data. This is used in training.
+        return self.score(x)
+
+    def score(self, xt, xe=None, emap=None):
+ 
+        if xe is None:
+            xe = xt
+        xem = xe-self.mu.T
+        xtm = xt-self.mu.T
+
+        # Use the HTPLDA scorer with nu = inf. This is not efficient. Eventually it needs to be
+        # changed to a GPLDA-specific implementation
+        return htplda.score_matrix(self.H, self.F, self.nu, xem.T, xtm.T, emap)
+        
+    def score_with_stats(self, xt, M, N):
+
+        Me  = M - self.mu.T
+        Ne  = N
+        xtm = xt - self.mu.T
+        # Use the HTPLDA scorer with nu = inf. This is not efficient. Eventually it needs to be
+        # changed to a GPLDA-specific implementation
+        return htplda.score_matrix_with_stats(self.H, self.F, self.nu, Me.T, xtm.T, Ne)
+
+    def init_with_plda_trained_generatively(self, x, class_ids, init_params, domain_ids=None, sample_weights=None):    
+        # Compute a PLDA model with the input data. See Quadratic.init_with_plda_trained_generatively for
+        # code with comments
+
+        weights = compute_weights(class_ids, domain_ids, init_params.get('balance_method'), sample_weights)
+
+        if init_params.get('lda_by_class_x_domain'):
+            assert not init_params.get('balance_method') and sample_weights is None
+            _, init_ids = np.unique([str(s)+','+str(c) for s,c in zip(class_ids, domain_ids)], return_inverse=True)
+            weights = compute_weights(init_ids, domain_ids, init_params.get('balance_method'))
+        else:
+            init_ids = None
+
+        # Bi and Wi are the between and within covariance matrices and mu is the global (weighted) mean
+        Bi, Wi, mu = generative.compute_2cov_plda_model(x, class_ids, weights, init_params.get('plda_em_its',0), init_ids=init_ids)
+
+        # Wi = H @ H.T
+        # Bi^{-1} = F  @ F.T
+        H = linalg.sqrtm(Wi)
+        F = linalg.sqrtm(linalg.inv(Bi))
+
+        state_dict = {'H': H, 'F': F, 'mu': mu.T}
+
+        utils.replace_state_dict(self, state_dict)
 
 
 class HTPLDA(nn.Module):
@@ -1023,7 +1210,7 @@ class HTPLDA(nn.Module):
             raise Exception("Sample weights not implemented for HT-PLDA initialization")
         
         balance_method = init_params.get('balance_method')
-        if (balance_method not in [None, 'none']) or sample_weights is not None:
+        if (balance_method not in [None, 'none']):
             raise Exception("Balance method not implemented for HT-PLDA initialization")
 
         class_weights = None
@@ -1075,6 +1262,17 @@ class Affine(nn.Module):
 
     def init_with_params(self, param_dict):
         utils.replace_state_dict(self, param_dict)
+
+    def init_random(self, std):
+        nn.init.normal_(self.W, 0.0, std)
+        if self.has_bias:
+            nn.init.normal_(self.b, 0.0, std)
+
+    def init_with_constant(self, k, std_for_mats=0):
+        if std_for_mats>0:
+            self.init_random(std_for_mats)
+        utils.replace_state_dict(self, {'b': k})
+
 
     def init_with_lda(self, x, class_ids, init_params, complement=True, sec_ids=None, gaussian_backend=False, sample_weights=None):
 
@@ -1244,7 +1442,7 @@ def compute_weights(class_ids, domain_ids, balance_method=False, external_sample
             sample_weights *= utils.compute_weights_to_balance_by_class(class_x_dom)
             num_dom_per_class =  np.array([len(np.unique(domain_ids[class_ids==c])) for c in unique_cids])
             sample_weights *= 1/num_dom_per_class[class_ids]
-        utils.print_weights_by_class(class_x_dom, sample_weights)
+#        utils.print_weights_by_class(class_x_dom, sample_weights)
     
     dom_weight = np.ones_like(unique_doms, dtype=float)
     for d in unique_doms:
@@ -1269,3 +1467,108 @@ def compute_weights(class_ids, domain_ids, balance_method=False, external_sample
     
     return {'class_weights': class_weights, 'sample_weights': sample_weights}
 
+
+    def __init__(self, in_dim, out_dim, out_activation, inner_sizes, inner_activation):
+        super().__init__()
+
+        self.hidden = nn.ModuleList()
+        in_dimi = in_dim 
+        for size in inner_sizes:
+            self.hidden.append(Affine(in_dimi, size, inner_activation))
+            in_dimi = size
+
+        self.outlayer = Affine(size, out_dim, out_activation)
+
+
+    def forward(self, x):
+        for layer in self.hidden:
+            x = layer(x)
+        return self.outlayer(x)
+
+
+class FeaturesFromScalar(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+
+        self.representation = config.get('representation', config.get('duration_representation', 'log'))
+        self.thresholds = config.get('thresholds', config.get('duration_thresholds'))
+
+        if self.representation == 'logpa':
+            # Logarithm with a shift initiliazed with 0
+            self.logdur_shift = Parameter(torch.tensor(0.0))
+        
+        elif self.representation in ['siglog', 'siglogp']:
+            scale = config.get('sigmoid_scale', config.get('duration_sigmoid_scale'))
+            centers = np.log(self.thresholds)
+            if self.representation == 'siglogp':
+                # Scale and centers are learnable parameters, initialized
+                # with the provided value
+                self.siglogdur_scale   = Parameter(torch.tensor(scale))
+                self.siglogdur_centers = Parameter(torch.tensor(centers))
+            else:
+                self.siglogdur_scale   = scale
+                self.siglogdur_centers = centers
+
+        # Fake input to the forward to get the dimension of the output
+        self.dim = self.forward(torch.ones(10)).shape[1]
+
+    @staticmethod
+    def bucketize(tensor, boundaries):
+        result = torch.zeros_like(tensor, dtype=torch.int64)
+        for boundary in boundaries:
+            result += (tensor > boundary).int()
+        return result
+
+    def forward(self, scalars):
+        # The input are expected to be scalars (one per sample)
+        # The output is some set of features obtained as a function of each scalar. 
+
+        if self.representation == 'log':
+            feats = torch.log(scalars.unsqueeze(1))
+
+        elif self.representation == 'logpa':
+            # Logarithm with a shift initiliazed with 0
+            feats = torch.log(scalars.unsqueeze(1)+self.logdur_shift)
+
+        elif self.representation == 'log2':
+            feats = torch.log(scalars.unsqueeze(1))
+            feats = torch.cat([feats, feats*feats], 1)
+
+        elif self.representation == 'idlog':
+            feats = scalars.unsqueeze(1)
+            feats = torch.cat([feats/100, torch.log(feats)], 1)
+
+        elif self.representation == 'siglog' or self.representation == 'siglogp':
+            feats = torch.log(scalars.unsqueeze(1))
+            # Take the log feats and multiplied them by a sigmoid centered a some value
+            # and then again with a rotated sigmoid
+            fs = []
+            prev_sig = 0
+            for c in self.siglogdur_centers:
+                sigf = torch.sigmoid(-self.siglogdur_scale*(feats-c)) 
+                sig = sigf - prev_sig
+                fs.append(feats*sig)
+                prev_sig = sigf
+            sig = 1-sigf
+            fs.append(feats*sig)
+            feats = torch.cat(fs, 1)
+
+        else:
+            durs_disc = self.bucketize(scalars, self.thresholds)
+            durs_onehot = nn.functional.one_hot(durs_disc, num_classes=len(self.thresholds)+1).type(torch.get_default_dtype())
+            if self.representation == 'pwlog':
+                feats = torch.log(scalars.unsqueeze(1)) * durs_onehot
+            elif self.representation == 'discrete':            
+                feats = durs_onehot
+            else:
+                raise Exception("FeatureFromScalar representation %s not implemented"%self.representation)
+
+        return feats
+
+
+def average_embeddings_over_sides(map_onehot, embeddings):
+
+    return map_onehot.T @ embeddings / map_onehot.sum(0, keepdims=True).T
+
+    
