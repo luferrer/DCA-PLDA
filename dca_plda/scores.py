@@ -63,17 +63,17 @@ class Key(object):
         print("Loaded key file %s"%filename)
         check_align = False
         if enrollids is not None:
-            missing = set.difference(set(enrollids),set(enrollids_in_key))
+            missing = set.difference(set(enrollids_in_key),set(enrollids))
             if len(missing)>0:
-                print("  There were %d enrollment ids in the key missing from the input enrollids list. Deleted them from key."%len(missing))
+                print("  There are %d enrollment ids in the key missing from the input enrollids list. Deleting them from key."%len(missing))
             check_align = True
         else:
             enrollids = enrollids_in_key
 
         if testids is not None:
-            missing = set.difference(set(testids),set(testids_in_key))
+            missing = set.difference(set(testids_in_key),set(testids))
             if len(missing)>0:
-                print("  There were %d test ids in the key missing from the input testids list. Deleted them from key."%len(missing))
+                print("  There are %d test ids in the key missing from the input testids list. Deleting them from key."%len(missing))
             check_align = True
         else:
             testids = testids_in_key
@@ -242,7 +242,7 @@ class IdMap(object):
                 missing[sid] = missing[sid] + 1 if sid in missing else 1
 
         mappings = []
-        for K in np.unique([len(l) for l in idmap.model_dict.values()]):
+        for K in np.sort(np.unique([len(l) for l in idmap.model_dict.values()])):
             mids = []
             mmap = []
             for mid, sid_list in idmap.model_dict.items():
