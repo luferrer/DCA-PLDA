@@ -481,7 +481,7 @@ def compute_performance_with_confidence_intervals(scores, keylist, outfile, logi
             sel_test_idxs   = select_indexes(key.test_ids)
             sel_enroll_idxs = select_indexes(key.enroll_ids)
 
-            sel_key = Key(np.array(key.test_ids)[sel_test_idxs], np.array(key.enroll_ids)[sel_enroll_idxs], key.mask[np.ix_(sel_enroll_idxs,sel_test_idxs)])
+            sel_key = Key(np.array(key.enroll_ids)[sel_enroll_idxs], np.array(key.test_ids)[sel_test_idxs], key.mask[np.ix_(sel_enroll_idxs,sel_test_idxs)])
  
             ascores = scores.align(sel_key)
             tar = ascores.score_mat[sel_key.mask==1]
