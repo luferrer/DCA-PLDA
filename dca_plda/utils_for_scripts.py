@@ -487,7 +487,17 @@ def compute_sideinfo(model, dataset):
         si = model.score(data, si_only=True)
 
     return ids, si
-   
+
+def compute_lda_embeddings(model, dataset):
+
+    data = dataset.get_data()
+    ids  = dataset.get_ids()
+    model.eval()
+
+    with torch.no_grad():
+        si = model.score(data, x2_only=True)
+
+    return ids, si
 
 
 def print_graph(model, dataset, device, outdir):

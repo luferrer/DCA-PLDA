@@ -264,7 +264,7 @@ class DCA_PLDA_Backend(nn.Module):
 
         return si
 
-    def score(self, xt, xe=None, durt=None, dure=None, si_only=False, raw=False, subset_enrollment_idxs=None, emap=None):
+    def score(self, xt, xe=None, durt=None, dure=None, si_only=False, x2_only=False, raw=False, subset_enrollment_idxs=None, emap=None):
         # Same as the forward method but it allows for asymmetric scoring where the rows and columns
         # of the resulting score file corresponds to two different sets of data.
         # It also allows for an enrollment map which can be used for proper scoring for multi-enrollment cases.
@@ -283,6 +283,10 @@ class DCA_PLDA_Backend(nn.Module):
             x2e = xe
             x2t = xt
 
+        if x2_only:
+            assert xe is None
+            return x2t
+        
         if hasattr(self,'si_stage1'):
 
             sie = self.process_si(xe, x2e, emap) if hase else None
@@ -315,6 +319,7 @@ class DCA_PLDA_Backend(nn.Module):
         if si_only:
             assert xe is None and sit is not None
             return sit
+
         else:
 
             if self.config.get('si_dependent_shift_parameters'):
